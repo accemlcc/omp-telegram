@@ -2,54 +2,56 @@
 
 [中文版](README.zh.md)
 
-A standalone Go daemon connecting existing Telegram topics to `omp --mode rpc`. Each topic gets an independent omp process and session. Ordinary text prompts run sequentially within a topic, while different topics can run concurrently. See [PLAN.md](PLAN.md) for the design and acceptance scope, and [AGENTS.md](AGENTS.md) for development guidelines.
+Use [Oh My Pi](https://github.com/can1357/oh-my-pi) from Telegram topics. Each topic runs a separate omp session in a working directory you choose. Messages queue within a topic; different topics can work concurrently.
+
+Supports text conversations, images and files, session selection, and restoring active sessions after a service restart. Your existing omp model, credentials, tools, and session history remain managed by omp.
 
 ## Requirements
 
-- Linux or Linux under WSL2. The daemon uses Unix process groups and file locks; native Windows execution is not supported.
-- Go 1.26 or later, [just](https://github.com/casey/just), and access to Go modules for building. SQLite uses a pure Go driver.
-- A working omp installation and its runtime dependencies, with models and authentication configured for the service user. RPC must support the expected ready/framing protocol and v2 negotiation. Incompatible versions are rejected; there is no terminal-emulation fallback.
-- Network access to the Telegram Bot API and the selected model provider. Run only one polling instance per bot, with no active webhook or competing getUpdates consumer.
+- Linux, on amd64 or arm64.
+- A working omp installation and its runtime, such as Bun. Configure models and authentication for the same user that will run this service.
+- Access to Telegram and your model provider.
+- A Telegram bot and a chat with topics enabled. Group topics and topic-enabled private bot chats are supported; ordinary unthreaded chats are not.
 
-## Telegram setup
+Only one polling service may use a bot token at a time. Do not run it alongside a webhook or another `getUpdates` consumer.
 
-1. Create a bot through the official `@BotFather` and keep its token private.
-2. Prefer a supergroup with Topics enabled. Have an administrator create a topic, add the bot to the group, and allow it to send messages. The daemon does not create or reopen topics, so topic-management privileges are not required for this purpose.
-3. The bot must receive ordinary text messages. Disable privacy mode through BotFather's `/setprivacy` and re-add the bot if Telegram instructs you to, or grant administrator status if needed. Prefer minimal permissions. Receiving slash commands alone is insufficient for text conversations.
-4. Add your numeric user ID and the target numeric chat ID to the allowlists. Group chat IDs are usually negative. Before starting the daemon, use a Bot API client you control to inspect `message.from.id` and `message.chat.id` in getUpdates. Do not give the token to third-party ID lookup websites. Send messages as your personal account, not as an anonymous administrator or a channel.
-5. Inside a topic, send `/new test` to start a fresh omp session directly in `<workspace_root>/test`, or `/new /tmp/test` to work directly in `/tmp/test`. Missing directories are created; existing files are not copied or cleared. A bound topic can omit the argument to reuse its directory. `/resume <omp-session-id>` restores an existing native session and its original directory. Private chats require Telegram's threaded mode.
+## Install
 
-## Build, install, and run
+### Download a release
+
+Download the archive for your architecture from [Releases](https://github.com/fcying/omp-telegram/releases). For amd64:
 
 ```sh
-just
-chmod 600 config.toml
+mkdir -p "$HOME/tool/omp-telegram"
+tar -xJf omp-telegram-linux-amd64.txz -C "$HOME/tool/omp-telegram"
 ```
 
-`just` and `just build` compile `./omp-telegram`. `just install` builds and installs only the binary to `~/tool/omp-telegram/omp-telegram`; use `just install /your/bin/directory` to choose another directory. Configuration and data are not copied. `just test` depends on `install`, then runs `supervisord ctl restart omp-telegram`, using your existing go-supervisor configuration. Configure that service to run the binary in the default installation directory. Service arguments and environment come from supervisor, not the invoking shell. `just check` runs unit tests, race checks, and vet without Telegram polling. Deployment remains user-managed.
+For arm64, use `omp-telegram-linux-arm64.txz`. Archives contain the binary and LICENSE; omp itself is installed separately. `SHA256SUMS` is provided with each release.
 
-Use `--config <path>` or `-c <path>` to select a configuration file, and `--check` to validate it without starting the service. For example: `./omp-telegram -c config.local.toml --check`.
+### Build from source
 
-Without `--config`, the bridge first reads `config.toml` next to the real executable after resolving symlinks. If that file is absent, it uses the repository's `config.toml` embedded at build time, without creating a configuration file. Existing unreadable or invalid files still fail, as does a missing explicit `--config` path. The bundled configuration requires `OMP_TELEGRAM_BOT_TOKEN`, `OMP_TELEGRAM_ALLOWED_USERS`, and `OMP_TELEGRAM_ALLOWED_CHATS` in the process environment. Installing elsewhere still changes the default data and workspace locations; existing data is not migrated. For foreground operation, set the required environment variables and run `./omp-telegram`; use `./omp-telegram --check` to validate configuration, or `./omp-telegram --config config.local.toml` for private settings. Explicit relative configuration paths are caller-relative. Do not run foreground and supervisor instances with the same bot or database simultaneously. Ctrl-C stops a foreground instance. No credentials are written to the tracked template, and no static project list is needed.
+Requires Go as specified in [go.mod](go.mod) and [just](https://github.com/casey/just):
 
-| Field | Meaning |
-| --- | --- |
-| `token` | Bot token; prefer `"${OMP_TELEGRAM_BOT_TOKEN}"` rather than a literal secret. Defaults to that reference when omitted |
-| `allowed_users`, `allowed_chats` | Numeric ID arrays; both allowlists must match. There is no automatic pairing |
-| `workspace_root` | Root for dynamically created workspaces; defaults to `OMP_TELEGRAM_WORKSPACE_ROOT`, or `workspace/` under the real executable directory when that variable is unset or empty |
-| `omp` | Defaults to `"omp"`, resolved through `PATH`; an executable name or path, not a shell command with arguments |
-| `omp_args` | Optional quoted argument string; defaults to `${OMP_TELEGRAM_ARGS}`. Unset or empty means no additional arguments |
-| `data_dir` | Defaults to `.`: `omp-telegram.db` and `daemon.lock` live directly under the real executable directory |
-| `max_workers` | Maximum number of simultaneously running omp processes |
-| `queue_capacity` | Capacity of each topic's waiting text-prompt queue |
+```sh
+git clone https://github.com/fcying/omp-telegram.git
+cd omp-telegram
+just install
+```
 
-Relative workspace roots and the data directory resolve against the real executable directory, not the launch working directory or configuration file's directory. Absolute values are unchanged. Two daemons cannot use the same data directory, and different bots must not share one.
+This installs the binary to `~/tool/omp-telegram/omp-telegram`. Use `just install /your/bin/directory` to choose another directory. Configuration and data are not copied. Without just, build with `go build -o omp-telegram ./cmd/omp-telegram`.
 
-By default, bridge configuration, state, and workspaces stay next to the executable: `config.toml`, `omp-telegram.db`, `daemon.lock`, and `workspace/`. This is bridge configuration, not omp configuration. Unless you explicitly supply startup options through `omp_args`, omp keeps its own model, authentication, approval, extension, and history defaults. The bridge does not automatically pass `--session-dir`, relocate history, or maintain a second model transcript. It stores only the session path returned by omp for resuming. SQLite may also create `omp-telegram.db-wal` and `omp-telegram.db-shm` while running; do not delete them or copy only the main database during active writes. Database files remain private; existing project-directory permissions are not changed.
+## Quick start
 
-String values support `$VAR` and `${VAR}` environment references. Use `$$` for a literal dollar sign. Expansion happens once after TOML parsing and cannot inject TOML fields. Missing variables normally fail loading. An exact reference to `OMP_TELEGRAM_WORKSPACE_ROOT` in `workspace_root` falls back to executable-directory `workspace/` when unset or empty; omitting the field uses that reference, and an explicit empty field uses the same fallback. `OMP_TELEGRAM_ARGS` in `omp_args` is also optional, as described below. Explicit nonempty settings take precedence. Shell defaults such as `${VAR:-fallback}`, command substitution, and automatic `.env` loading are not supported.
+### 1. Prepare Telegram
 
-IDs and limits accept either TOML integers or quoted decimal strings. Allowlist string elements also accept comma-separated IDs, including values expanded from environment variables; surrounding whitespace is ignored, but empty or invalid entries fail loading. Limits still require a single integer. Quote references; do not write unquoted `${VAR}` in TOML. Keep allowlists inside TOML arrays as shown below:
+1. Create a bot with [@BotFather](https://t.me/BotFather) and keep its token private.
+2. Enable topics and create a topic to use. In a group, add the bot and allow it to send messages. For private chats, enable the bot's topic/threaded mode. This service does not create topics.
+3. For groups, ensure the bot receives ordinary messages, not just commands. Disable privacy mode with BotFather's `/setprivacy`, following any instructions to re-add the bot, or grant the necessary administrator permissions.
+4. Obtain your numeric user ID and chat ID. Before starting this service, use a Bot API client you control to inspect `message.from.id` and `message.chat.id` in [getUpdates](https://core.telegram.org/bots/api#getupdates). Never give your bot token to an ID lookup website. Send as your personal account, not an anonymous administrator or channel.
+
+### 2. Prepare the configuration
+
+Save the default configuration below as `~/tool/omp-telegram/config.toml`, beside the binary. You can also copy the repository's [config.toml](config.toml) and adjust it as needed:
 
 ```toml
 token = "${OMP_TELEGRAM_BOT_TOKEN}"
@@ -59,125 +61,161 @@ omp = "omp"
 omp_args = "${OMP_TELEGRAM_ARGS}"
 data_dir = "."
 workspace_root = "${OMP_TELEGRAM_WORKSPACE_ROOT}"
-max_workers = "${OMP_TELEGRAM_MAX_WORKERS}"
+max_workers = 4
 queue_capacity = 16
 ```
 
-Export each referenced variable before starting the daemon, or supply it through your chosen process manager. The distributed example requires `OMP_TELEGRAM_BOT_TOKEN`, `OMP_TELEGRAM_ALLOWED_USERS`, and `OMP_TELEGRAM_ALLOWED_CHATS`. The example above additionally requires `OMP_TELEGRAM_MAX_WORKERS`. For multiple users/chats, set values such as `OMP_TELEGRAM_ALLOWED_USERS=123456789,987654321` and `OMP_TELEGRAM_ALLOWED_CHATS=123456789,987654321,-1001234567890`, or use literal TOML arrays. Private chat IDs match the corresponding user IDs; group chat IDs are negative. Authorization requires membership in both global allowlists; these are not per-user chat assignments.
+If no configuration file is specified and the default file is absent, the service uses these embedded defaults without generating a file.
 
-`/new` creates a new omp process and conversation, not a new filesystem identity. `/new test` uses `<workspace_root>/test` directly; `/new /tmp/test` uses `/tmp/test` directly. Absolute and `~`/`~/...` paths may be missing: the bridge resolves existing ancestor symlinks and creates the requested directory. Existing directories and files remain in place. Simple names must be one component, not `.`, `..`, a nested relative path, or a control-character string; named-directory symlinks and dangling links are rejected. No path-derived group or random ID directory is added.
+### 3. Set the environment and start
 
-An unbound topic must supply a name/path for `/new`. A bound topic's argument-free `/new` starts a fresh native session in the exact saved directory, even if `workspace_root` has changed. Replacing a running instance requires confirmation. Different topics can explicitly choose the same directory: conversations remain separate, but files are shared and concurrent edits can conflict.
+Set the variables referenced by the configuration. Replace the example token and IDs with your own:
 
-Use `/resume` to choose a native omp session in this topic's working directory. A short-lived `omp acp` process supplies the list through `session/list`; the bridge neither scans session files nor substitutes its database history. The picker shows eight sessions per page, with titles, IDs, timestamps, Previous/Next, and Cancel. Selection replaces an idle instance; active tasks, compaction, or queued prompts block switching. Old, expired, and other-user callbacks cannot switch sessions. A topic without a directory must first use `/new <name or path>` or the explicit ID shortcut.
+```sh
+export OMP_TELEGRAM_BOT_TOKEN='your-bot-token'
+export OMP_TELEGRAM_ALLOWED_USERS=123456789
+export OMP_TELEGRAM_ALLOWED_CHATS=123456789
 
-`/resume <omp-session-id>` remains a shortcut, including from an unbound topic; close an existing instance first. A hexadecimal prefix of at least eight characters is accepted by native lookup; prefer the full ID. omp restores the session and its recorded directory. The bridge reads RPC identity and local `/session info` metadata, saves the native session-file path, and shows the native ID in the ready message and `/status`. One native session cannot run in multiple bridge topics. Missing original directories fail rather than being recreated. An unused new session may not be resumable until omp persists its history.
-
-### Explicit omp startup arguments
-
-To use an omp configuration overlay specifically for Telegram, keep this in the bridge's `config.toml`:
-
-```toml
-omp_args = "${OMP_TELEGRAM_ARGS}"
+~/tool/omp-telegram/omp-telegram --check
+~/tool/omp-telegram/omp-telegram
 ```
 
-Set the environment variable in your shell, quoting paths containing spaces:
+In a private chat, the chat ID matches your user ID. For a group, use its negative chat ID, such as `-1001234567890`. Multiple IDs may be comma-separated. Both the user and chat allowlists must match.
+
+Keep the token private. Typing it directly into a shell may leave it in command history; protect any startup file containing it and do not commit it to Git.
+
+`--check` validates local configuration, finds the omp executable, and creates the configured data/workspace directories; it does not test Telegram or model authentication. The second command runs in the foreground; Ctrl-C stops the service.
+
+### 4. Start a conversation in a topic
+
+```text
+/new demo
+```
+
+With the default workspace root, this creates or opens `workspace/demo` beside the installed binary and starts a new omp session there. You can instead select a directory on the machine running the service:
+
+```text
+/new /home/you/projects/my-app
+```
+
+Wait for the ready message, then send ordinary text. Missing directories are created; existing files are not copied or cleared.
+
+## Topic commands
+
+| Command | What it does |
+| --- | --- |
+| `/new <name or path>` | Start a fresh session in the selected directory. Replacing a running instance requires confirmation |
+| `/new` | Start a fresh session in this topic's previously selected directory |
+| `/stop` | Stop the current task and clear queued prompts, keeping the session open |
+| `/close` | Close the omp instance, preserving files and session history |
+| `/resume` | Choose a saved omp session in the current directory using paginated buttons |
+| `/resume <session ID>` | Restore a native omp session and its original directory; close any running instance first |
+| `/status` | Show the directory, session ID, model, activity, and queue |
+| `/model` | Show the current status and model |
+| `/model provider/model` | Switch models while idle |
+| `/compact` | Compact context while idle, after confirmation |
+| `/help`, `/start` | Show help |
+
+Use `/status` or the ready message to find the native omp session ID. Prefer the full ID when restoring. The `/resume` picker requires an idle topic with no queued prompts. Ordinary messages never start a new instance by themselves, and unsupported slash commands are not forwarded to omp.
+
+Bot menus, buttons, and service messages are in English. You can write prompts in any language; model replies are not translated by the service.
+
+### Restart and recovery
+
+- Restarting the service restores sessions that were still open. Topics closed with `/close` stay closed; `/stop` does not disable restoration.
+- Interrupted tasks are not rerun, and previously queued ordinary prompts are canceled. Check the conversation and files before deciding to resend a request.
+- A missing session file or working directory causes recovery to fail, not to create a replacement session. Startup or session-switch interruptions may require manual `/resume`.
+- **Send `/close` before deleting a topic.** Deleting a Telegram topic does not automatically stop its omp instance.
+
+## Images and files
+
+Send photos or documents with Telegram's attachment button. Add a caption to tell omp what to do. Without one, omp is asked to inspect the attachment. Albums are processed as separate messages.
+
+To receive a file, ask naturally, for example: "Send me the report as a file." omp can return regular files from the current working directory. A message saying an attachment is queued does not mean it has arrived; check for the actual attachment.
+
+| Transfer | Limit |
+| --- | --- |
+| Download from Telegram | 20 MB |
+| Send a document | 50 MB |
+| Send a photo | 10 MB, JPEG or PNG |
+
+Incoming originals remain under `.telegram/incoming/` in the working directory. Large images may be represented by a preview or a local file path. Image understanding depends on the model, and document reading depends on its available tools. Stopping a task does not delete originals already submitted to omp.
+
+## Configuration
+
+Settings are loaded in this order:
+
+1. The file selected by `--config <path>` or `-c <path>`.
+2. Otherwise, `config.toml` beside the real executable, after resolving symlinks.
+3. If that default file is absent, the embedded configuration. No file is generated.
+
+An explicitly selected missing file, an unreadable file, or invalid TOML causes startup to fail. The default configuration above includes the required allowlists.
+
+| Setting | Purpose |
+| --- | --- |
+| `token` | Bot token; prefer an environment reference |
+| `allowed_users`, `allowed_chats` | Required numeric ID allowlists; literal integers or comma-separated environment values |
+| `omp` | Executable name found through `PATH`, or an absolute path; not a shell command |
+| `omp_args` | Extra omp arguments; defaults to optional `OMP_TELEGRAM_ARGS`. An explicit empty string disables them |
+| `data_dir` | Database, lock, and outgoing attachment storage; defaults to the executable directory |
+| `workspace_root` | Base directory for `/new <name>`; defaults to optional `OMP_TELEGRAM_WORKSPACE_ROOT`, then executable-directory `workspace/` |
+| `max_workers` | Maximum active topic instances, default 4 |
+| `queue_capacity` | Waiting prompts per topic, default 16 |
+
+Strings support `$VAR` and `${VAR}`; use `$$` for a literal dollar sign. The default references to `OMP_TELEGRAM_ARGS` and `OMP_TELEGRAM_WORKSPACE_ROOT` may be unset; other missing references fail. `.env` files and shell startup files are not loaded automatically.
+
+To select another bridge configuration:
+
+```sh
+~/tool/omp-telegram/omp-telegram -c "$HOME/.config/omp-telegram/config.toml" --check
+```
+
+### Pass options to omp
+
+For example, to use an omp configuration overlay you have prepared:
 
 ```sh
 export OMP_TELEGRAM_ARGS="--config \"$HOME/.config/omp/telegram.yml\""
 ```
 
-Or configure the string directly instead:
+This configures **omp**, not the bridge. You can also set `omp_args` in TOML. Arguments support quoting but are passed directly without a shell; use absolute paths for configuration files. The bridge does not change omp's configuration, credentials, tools, or approval policy automatically. RPC mode, working directory, and session lifecycle options are reserved for the bridge.
 
-```toml
-omp_args = '--config "${HOME}/.config/omp/telegram.yml"'
+Restart the service after changing configuration or its environment. For background operation, use your preferred process manager and explicitly provide the environment and a `PATH` containing both omp and its runtime.
+
+## Data, upgrades, and safety
+
+By default, runtime data stays beside the installed binary:
+
+```text
+~/tool/omp-telegram/
+├── omp-telegram
+├── config.toml          # Optional
+├── omp-telegram.db
+├── daemon.lock
+└── workspace/
 ```
 
-Create that file yourself using omp's configuration format. The bridge only passes its path to omp; it does not create or modify omp configuration files. Options such as `--profile` or `--model` can also be supplied explicitly. These arguments apply whenever a worker starts, including `/resume`; restart the daemon to load changed configuration or environment variables.
+**Relative `data_dir` and `workspace_root` paths are based on the executable directory**, not the launch directory or configuration file's location. Moving the binary can therefore select a different database. Use absolute paths when keeping data elsewhere. An explicit relative `--config` path is the exception: it is caller-relative.
 
-The string is tokenized using shell-style quotes and backslash escapes, then passed directly as argv. No shell, command substitution, globbing, or `~` expansion runs. Values obtained from `OMP_TELEGRAM_ARGS` are not recursively environment-expanded: expand `$HOME` in your shell as shown above, or supply an actual absolute path. Unlike bridge data paths, relative paths in omp arguments are interpreted by omp in the worker's working directory. Use absolute paths for configuration overlays.
+Before upgrading, stop the service and back up its data directory, working directories, and omp's own session storage. The bridge database alone is not a backup of omp conversations. Do not delete SQLite's `-wal`/`-shm` files or copy only the main database while it is being written. Older unversioned development databases are not automatically upgraded; back them up and use a fresh data directory if startup reports an unsupported schema.
 
-Omitting `omp_args` defaults to the optional `OMP_TELEGRAM_ARGS` variable; unset or empty means no additional arguments. Explicit `omp_args = ""` disables extra arguments even if the environment variable is set. Malformed quotes fail configuration loading without logging argument values.
+Check the installed application version with `~/tool/omp-telegram/omp-telegram --version` or `-v`.
 
-RPC mode, working directory, and session lifecycle remain bridge-managed. `--mode`, `--cwd`, `--resume`/`--session`/`-r`, `--continue`/`-c`, `--print`/`-p`, `--no-session`, and the `--` separator are rejected in `omp_args`. Other explicit options are interpreted by omp, including their validation and permission effects.
+- Authorize trusted users only. omp runs with the service user's filesystem permissions and environment. Separate topic sessions are not a filesystem or credential sandbox.
+- Group members may see prompts and replies even when they cannot control the bot. The database stores message content and currently has no automatic retention cleanup.
+- A send timeout may still mean a message arrived. Do not assume a missing reply means the task did not run.
+- Prefer normal shutdown over `kill -9`; forced termination does not guarantee that every tool subprocess exits.
 
-Read the token interactively in Bash to avoid putting its value in shell history:
+## Troubleshooting and limitations
 
-```sh
-export OMP_TELEGRAM_ALLOWED_USERS=123456789
-export OMP_TELEGRAM_ALLOWED_CHATS="$OMP_TELEGRAM_ALLOWED_USERS"
-read -r -s -p 'Telegram bot token: ' OMP_TELEGRAM_BOT_TOKEN; printf '\n'
-export OMP_TELEGRAM_BOT_TOKEN
-just build
-./omp-telegram --check
-./omp-telegram
-```
-
-`./omp-telegram --check` validates configuration without starting Telegram polling: it parses TOML, expands references, checks startup arguments and the omp executable, and creates the data directory and workspace root. Referenced variables must be set except for the optional workspace root and omp arguments. It does not validate model authentication or parse omp's own configuration file. For a supervisor-managed instance, set the environment in supervisor and use `just test` to rebuild and restart it.
-
-## Topic commands
-
-The Telegram interface is English-only: slash-command descriptions, `/help`, status, confirmation buttons, progress labels, and bridge errors use English regardless of client language. The daemon registers the English command list at startup and replaces its previously registered Chinese list with English too. Type `/` in a topic to see suggestions; reopen the chat if Telegram cached an older menu. Registration failures stop startup with a sanitized error. User messages, model replies, and extension-provided dialog content are not translated. This README and README.zh.md remain bilingual documentation. Menu visibility does not grant permission to execute commands.
-
-| Command | Behavior |
+| Symptom | Check |
 | --- | --- |
-| `/new [name or path]` | Start a fresh omp session directly in the selected directory, creating it if missing; omit the argument later to reuse the exact directory. Existing files remain intact |
-| `/stop` | Request cancellation of the current task and clear waiting text prompts, keeping the session |
-| `/close` | Close the instance and clear waiting text prompts, preserving history |
-| `/resume [omp-session-id]` | Without an ID, choose a native session in the current directory using paginated buttons; with an ID, restore it directly after closing the current instance |
-| `/status` | Show working directory, native session ID, model, activity and queue information; when not running, report the global count of uncertain records |
-| `/model` | Show the current status and model |
-| `/model provider/model` | Switch models while idle |
-| `/compact` | Compact context while idle, after button confirmation |
-| `/help`, `/start` | Show help |
+| Bot does not respond | Both allowlists, topic mode, group privacy settings, and whether another poller or webhook is using the bot |
+| `omp executable not found` | The service process's `PATH`, including omp and its runtime; your interactive shell may have a different environment |
+| `/resume` shows no sessions | The selected directory and whether omp has saved history yet. A new empty session may not have a resumable file |
+| `/compact` fails | Short sessions may have nothing to compact. Check omp's model configuration if compaction also fails locally |
+| Unsupported database schema | Back up the database and use a supported database or fresh data directory; do not change the version number by hand |
 
-Ordinary text goes only to an already running instance; text never starts a process automatically. `/command@botname` is supported. Unknown slash commands are not forwarded to omp. Output uses throttled previews and split final messages, without forwarding raw RPC state or full tool output.
+Voice/transcription, automatic topic creation, and arbitrary terminal input/editor dialogs are not supported. Some confirmation/selection prompts can use Telegram buttons, but not every interactive tool approval is available remotely. Automatic approval is never enabled by the bridge; verify the approval workflows you rely on before leaving a session unattended.
 
-RPC `confirm` and a bounded number of `select` options use buttons and are canceled on timeout. These can represent permission requests only when omp exposes them through RPC; this is not a mirror of every terminal permission dialog. `input`/`editor` dialogs are unsupported and explicitly canceled. The bridge never enables automatic approval. It does not modify omp configuration files or override model/credential/approval settings. It registers the bridge-owned `telegram_send` RPC host tool for the attachment transport described below; other configuration changes still require explicit `omp_args` or Telegram commands such as `/model`.
-
-## Images and files
-
-Use Telegram's normal photo or attachment button inside a topic with a running omp instance. No upload command is needed. The caption becomes the prompt; without a caption, the bridge asks omp to inspect the attachment. Captions are treated as prompt text, not bridge slash commands. Albums are handled as separate incoming messages, sequentially within the topic.
-
-Original files are retained in the current workspace under `.telegram/incoming/`. Filenames are sanitized, and download paths are confined to that workspace. Supported JPEG/PNG/GIF/WebP images are included in the RPC prompt. The inline budget is 512 KiB: larger images get a bounded JPEG preview while the original remains available by local path. Images over the 16-million-pixel decoding limit, unsupported formats, and non-image documents are supplied by local path with an explicit note, not misrepresented as an inline image. Image interpretation requires a capable model; reading local documents depends on omp's configured tools.
-
-Originals submitted to omp are kept for the session. Failed or canceled preparation is cleaned up; stopping a task does not delete files that were already submitted to omp.
-
-For replies, ask naturally, such as "send me the report" or "send that image back". omp can call `telegram_send` with `path`, optional `kind` (`document` by default or `photo`), and optional `caption`. No `/sendfile` command is required. The tool accepts only regular files inside the current workspace and can run only during an active Telegram request. It cannot choose another chat/topic. Source files are copied to private snapshots under `<data_dir>/attachments/outbox/` before durable enqueueing. A tool success means queued, not confirmed delivery; confirmed uploads remove their snapshots, while uncertain deliveries retain them and are not automatically replayed.
-
-With the hosted Telegram Bot API, downloads are capped at 20 MB, documents at 50 MB, and photos at 10 MB. Outgoing photos must be JPEG/PNG with Telegram-compatible dimensions; use document mode for originals or other formats. Captions are limited to 1024 UTF-16 code units. Download/preparation is asynchronous and bounded so `/stop` is not stuck behind a file transfer. Each transfer has a five-minute request timeout. Authorization runs before any file download. The database stores attachment metadata and delivery state, not binary file contents.
-
-Voice messages, transcription, and automatic topic creation are not supported. The bridge does not scan directories or automatically upload every generated file.
-
-## Recovery and security boundaries
-
-- At startup, the daemon automatically restores topics whose instances were still running at shutdown, using their exact saved native session-file paths and working directories. `/close` disables automatic restoration; `/stop` keeps the instance eligible. Recovery is scoped to the current bot and allowed chats and respects `max_workers`. Missing sessions/directories or capacity limits leave the saved identity and restoration intent intact; use `/resume` after resolving the problem, or retry on the next service restart. No replacement session is silently created.
-- Database schema version 1 is recorded in SQLite's `PRAGMA user_version`. New empty databases create the current schema and version in one transaction. This development version does not migrate older schemas: populated unversioned databases and unsupported versions are rejected without changing their schema or records. Back up incompatible databases and use a fresh data directory; do not merely change the version number. Post-release schema changes will require explicit transactional migrations between versions.
-- Interrupted submitted tasks remain uncertain and are never automatically replayed. Previously persisted pending ordinary prompts are canceled at startup; restoration resumes the conversation, not the work. Inspect session history and workspace side effects before deciding to resend a request. Pending control commands still pass through normal authorization. `/resume` remains available for manual native session selection; the bridge never guesses with `--continue` or parses terminal output.
-- Final text reply parts and the ordinary task's inbox `done` state commit in one SQLite transaction. A persistence failure rolls back the whole completion. Already committed outbox results are not canceled by later session changes. Pending inbox/outbox queries use `(state,id)` indexes.
-- Delivery errors are classified in the Telegram client: proven local pre-send failures and complete explicit API rejections become `failed`; possible delivery without confirmation becomes `uncertain`. Neither state adds automatic resend. Existing bounded retries for explicit rate limits remain; retained attachment snapshots require manual handling.
-- Normal shutdown cleans the omp process group. On Linux, RPC and ACP launches also use parent-death SIGTERM, with the creating OS thread kept alive until the sole process wait completes. This costs one locked OS thread per live child and is not process-tree containment: descendants, ignored SIGTERM, or programs clearing the parent-death signal still need an external containment boundary. No deployment template is imposed.
-- Telegram delivery and local database commits are not one transaction. A timed-out message may already have arrived. There is no exactly-once guarantee, and a missing reply does not prove that tools did not execute.
-- Separate omp processes do not isolate filesystems or credentials. Topics using the same working directory share its files. Choose separate directories or prepare your own Git worktrees when concurrent edits must be isolated. The bridge does not create worktrees, clear project contents, or delete working directories.
-- omp inherits the daemon user's permissions and environment, including any bot token and model credentials. Use a dedicated low-privilege account, restrict filesystem and credential access, and authorize trusted operators only. Allowlists are not a tool-execution sandbox.
-- Telegram group members may see requests, answers, and button text even if they are not authorized operators. Do not send secrets. The bridge database stores session bindings and inbound/outbound message content, not omp's full model transcript. Completed message records currently have no automatic pruning; protect the database. Never share raw RPC/get_state output, which may contain authentication headers and system prompts.
-
-## Current limitations and verification status
-
-Text, native photos, and document attachments are supported in existing topics. Voice and automatic topic creation are not supported. There is no PTY/ANSI terminal emulation.
-
-Local verification with omp 18.2.1 covered distinct session IDs and paths for two real processes, one real model request returning `RPC_OK`, a terminal `agent_end`, restoration of the same session and message count after closing and resuming by path, and the other session remaining empty. The CLI `--check` command was also exercised successfully.
-
-Local protocol fixtures cover concurrent topic routing, queueing while busy and stop behavior, ownership and repeated clicks for new-session confirmations, close/resume, continued conversation after compaction, and sensitive-state filtering. SQLite tests cover atomic input/offset persistence, conversion of submitted tasks and in-flight deliveries to uncertain state on restart, no automatic replay, and session-history preservation. Telegram HTTP tests cover 429 responses, network errors, message formatting, and credential redaction.
-
-Dynamic workspace verification also exercised the real bridge with two actual omp processes and a simulated Telegram transport: distinct directories, a real `WORKSPACE_OK` model reply, restoration of the original directory/session, and a confirmed `/new` preserving old files. Actual CLI checks covered unset, empty, and explicit workspace-root environment values. These checks did not send messages through Telegram.
-
-Automatic restart recovery was exercised with a real omp model reply and daemon shutdown/reopen: the live topic resumed the exact native session file and working directory, while a closed topic stayed closed. Telegram transport was simulated for this check. Protocol fixtures additionally cover interrupted-task non-replay, canceled pending prompts, `/stop`, removed chat authorization, missing sessions, and reduced worker limits.
-
-Reliability checks injected a failed final-reply part and confirmed zero partial output and no false completion; successful completion retained ordered replies after reopening SQLite. Query plans use both state indexes. Local HTTP checks distinguish complete API rejection from ambiguous responses and missing local attachments. A real omp parent-SIGKILL experiment observed omp, shell, tool, and an ordinary grandchild all exit; isolated RPC/ACP fixtures also demonstrate that non-cooperating and escaped descendants can survive. These observations do not establish a universal tree-cleanup guarantee. The startup-intent transaction remains design-only in section 27 of [the design review](omp-telegram-daemon-design.md).
-
-Real Telegram `getMe` and `getWebhookInfo` calls verified bot connectivity, private topic capabilities, and no webhook conflict. Live document upload/download preserved exact bytes, and live photo upload/download returned a decodable image. A separate real-omp run with simulated Telegram transport recognized an uploaded image's color, read an uploaded document, and invoked `telegram_send` to return both originals. **A phone-originated attachment conversation, multi-topic fault scenarios, and real tool-approval dialogs still need end-to-end acceptance.** These distinct checks are not a claim of complete live UI coverage.
-
-```sh
-just check
-```
+For contributors: [architecture and development](doc/architecture.md).

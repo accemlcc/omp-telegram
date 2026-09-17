@@ -1,0 +1,164 @@
+name: release
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release: ${{ steps.release.outputs.release }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine release version
+        id: release
+        run: |
+          set -euo pipefail
+          source_version=$(sed -nE 's/^var Version = "(v[0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' cmd/omp-telegram/main.go)
+          if [[ ! "$source_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected one Version value in vMAJOR.MINOR.PATCH form" >&2
+            exit 1
+          fi
+          release=false
+          version="dev-${source_version}"
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]] && ! git show-ref --verify --quiet "refs/tags/${source_version}"; then
+            version="$source_version"
+            release=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Check format
+        run: |
+          unformatted=$(gofmt -l .)
+          if [[ -n "$unformatted" ]]; then
+            printf 'Files need gofmt:\n%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Check dependencies
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Race test
+        if: matrix.arch == 'amd64'
+        run: go test -race ./...
+
+      - name: Build and smoke test
+        run: |
+          set -euo pipefail
+          test "$(go env GOOS)/$(go env GOARCH)" = "linux/$TARGET_ARCH"
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -buildvcs=true -ldflags "-s -w -X main.Version=$VERSION" -o dist/omp-telegram ./cmd/omp-telegram
+          actual=$(OMP_TELEGRAM_BOT_TOKEN='' ./dist/omp-telegram --config /nonexistent --version)
+          [[ "$actual" == "omp-telegram $VERSION" || "$actual" == "omp-telegram $VERSION ("* ]]
+          test "$(./dist/omp-telegram -v)" = "$actual"
+          ./dist/omp-telegram --help
+          tar cJf "dist/omp-telegram-linux-${TARGET_ARCH}.txz" -C dist omp-telegram -C "$GITHUB_WORKSPACE" LICENSE
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/omp-telegram-linux-${{ matrix.arch }}.txz
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: release-linux-*
+          path: build
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: build
+        run: sha256sum ./*.txz > SHA256SUMS
+
+      - name: Publish versioned release
+        if: needs.prepare.outputs.release == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.prepare.outputs.version }}
+          commit: ${{ github.sha }}
+          immutableCreate: true
+          artifactErrorsFailBuild: true
+          generateReleaseNotes: true
+          artifacts: build/*
+
+      - name: Move development tag
+        run: |
+          git tag --force dev "$GITHUB_SHA"
+          git push --force origin refs/tags/dev
+
+      - name: Update development draft
+        uses: ncipollo/release-action@v1
+        with:
+          tag: dev
+          commit: ${{ github.sha }}
+          name: ${{ needs.prepare.outputs.version }}
+          allowUpdates: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          generateReleaseNotes: true
+          prerelease: true
+          draft: true
+          makeLatest: false
+          artifacts: build/*

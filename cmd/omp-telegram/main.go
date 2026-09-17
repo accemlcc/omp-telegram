@@ -8,12 +8,41 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strings"
 	"syscall"
 
 	"omp-telegram/internal/bridge"
 	"omp-telegram/internal/config"
 	"omp-telegram/internal/store"
 )
+
+var Version = "v0.1.0"
+
+func displayVersion() string {
+	revision := ""
+	modified := false
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = strings.TrimSpace(setting.Value)
+			case "vcs.modified":
+				modified = setting.Value == "true"
+			}
+		}
+	}
+	if revision == "" {
+		return Version
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return fmt.Sprintf("%s (%s)", Version, revision)
+}
 
 func main() {
 	if e := run(); e != nil {
@@ -25,7 +54,13 @@ func run() error {
 	path := flag.String("config", "", "TOML configuration file (--config or -c; default: executable-adjacent config.toml, otherwise embedded defaults)")
 	flag.StringVar(path, "c", "", "short form of --config")
 	check := flag.Bool("check", false, "validate configuration without connecting (--check)")
+	version := flag.Bool("version", false, "show application version and exit")
+	flag.BoolVar(version, "v", false, "short form of --version")
 	flag.Parse()
+	if *version {
+		fmt.Printf("omp-telegram %s\n", displayVersion())
+		return nil
+	}
 	c, e := config.Load(*path)
 	if e != nil {
 		return e

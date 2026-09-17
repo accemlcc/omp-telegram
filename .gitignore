@@ -15,6 +15,7 @@
 /omp-telegram
 /omp-telegram.exe
 /bin/
+/dist/
 *.db
 *.db-shm
 *.db-wal
