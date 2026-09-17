@@ -1,0 +1,20 @@
+# Local credentials and configuration
+/config.local.toml
+/config.*.local.toml
+/.env
+/environment
+!config.toml
+
+# Runtime database, sessions, and build output
+/data/
+/workspace/
+/attachments/
+.telegram/
+/sessions/
+/daemon.lock
+/omp-telegram
+/omp-telegram.exe
+/bin/
+*.db
+*.db-shm
+*.db-wal

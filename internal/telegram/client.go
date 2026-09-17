@@ -1,0 +1,318 @@
+package telegram
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+)
+
+type User struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	IsBot    bool   `json:"is_bot"`
+}
+
+type Chat struct {
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
+}
+
+type Message struct {
+	MessageID       int64       `json:"message_id"`
+	MessageThreadID int64       `json:"message_thread_id"`
+	From            *User       `json:"from"`
+	Chat            Chat        `json:"chat"`
+	Text            string      `json:"text"`
+	Caption         string      `json:"caption"`
+	Photo           []PhotoSize `json:"photo"`
+	Document        *Document   `json:"document"`
+	MediaGroupID    string      `json:"media_group_id"`
+}
+
+type PhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int64  `json:"file_size"`
+}
+
+type Document struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int64  `json:"file_size"`
+}
+
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    User     `json:"from"`
+	Message *Message `json:"message"`
+	Data    string   `json:"data"`
+}
+
+type Update struct {
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query"`
+}
+
+type Button struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data"`
+}
+
+type Keyboard struct {
+	InlineKeyboard [][]Button `json:"inline_keyboard"`
+}
+
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// APIError contains only a sanitized server description, never a request URL.
+type APIError struct {
+	Code        int
+	Description string
+	RetryAfter  int
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("telegram API %d: %s", e.Code, e.Description)
+}
+
+type deliveryError struct {
+	error
+	uncertain bool
+}
+
+func (e *deliveryError) Unwrap() error { return e.error }
+
+// DeliveryUncertain reports whether a failed operation may have been delivered.
+// Unclassified errors are conservative; nil means there was no failure.
+func DeliveryUncertain(err error) bool {
+	if err == nil {
+		return false
+	}
+	var delivery *deliveryError
+	if errors.As(err, &delivery) {
+		return delivery.uncertain
+	}
+	return true
+}
+
+func deliveryFailure(err error, uncertain bool) error {
+	if err == nil {
+		return nil
+	}
+	return &deliveryError{error: err, uncertain: uncertain}
+}
+
+type Client struct {
+	token   string
+	baseURL string
+	http    *http.Client
+}
+
+func New(token string) *Client {
+	return &Client{
+		token:   token,
+		baseURL: "https://api.telegram.org",
+		http: &http.Client{
+			Timeout: 40 * time.Second,
+			// Never forward the token or request body to a redirect target.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
+}
+
+func (c *Client) GetMe(ctx context.Context) (User, error) {
+	var user User
+	err := c.call(ctx, "getMe", struct{}{}, &user, true)
+	return user, err
+}
+
+func (c *Client) SetCommands(ctx context.Context, commands []BotCommand, languageCode string) error {
+	// Replacing the same command list is idempotent, so transport retries are safe.
+	return c.call(ctx, "setMyCommands", map[string]any{
+		"commands":      commands,
+		"scope":         map[string]string{"type": "default"},
+		"language_code": languageCode,
+	}, nil, true)
+}
+
+func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error) {
+	var updates []Update
+	err := c.call(ctx, "getUpdates", map[string]any{
+		"offset": offset, "timeout": 30,
+		"allowed_updates": []string{"message", "callback_query"},
+	}, &updates, true)
+	return updates, err
+}
+
+func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, keyboard *Keyboard) (Message, error) {
+	fields := map[string]any{"chat_id": chatID, "text": text}
+	if threadID != 0 {
+		fields["message_thread_id"] = threadID
+	}
+	if keyboard != nil {
+		fields["reply_markup"] = keyboard
+	}
+	var message Message
+	err := c.call(ctx, "sendMessage", fields, &message, false)
+	return message, err
+}
+
+func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string, keyboard *Keyboard) error {
+	fields := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text}
+	if keyboard != nil {
+		fields["reply_markup"] = keyboard
+	}
+	err := c.call(ctx, "editMessageText", fields, nil, false)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == 400 && strings.Contains(strings.ToLower(apiErr.Description), "message is not modified") {
+		return nil
+	}
+	return err
+}
+
+func (c *Client) AnswerCallback(ctx context.Context, id, text string) error {
+	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil, false)
+}
+
+func (c *Client) Typing(ctx context.Context, chatID, threadID int64) error {
+	fields := map[string]any{"chat_id": chatID, "action": "typing"}
+	if threadID != 0 {
+		fields["message_thread_id"] = threadID
+	}
+	return c.call(ctx, "sendChatAction", fields, nil, false)
+}
+
+func (c *Client) call(ctx context.Context, method string, fields any, result any, safe bool) error {
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return deliveryFailure(errors.New("telegram: cannot encode request"), false)
+	}
+	uncertain := false
+	for attempt := range 3 {
+		retry, delay, err := c.request(ctx, method, body, result, safe)
+		uncertain = uncertain || DeliveryUncertain(err)
+		if err == nil || !retry || attempt == 2 {
+			return deliveryFailure(err, uncertain)
+		}
+		if delay < 0 {
+			delay = time.Duration(attempt+1) * 200 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return deliveryFailure(ctx.Err(), uncertain)
+		case <-timer.C:
+		}
+	}
+	panic("unreachable")
+}
+
+func (c *Client) request(ctx context.Context, method string, body []byte, result any, safe bool) (bool, time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, deliveryFailure(err, false)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/bot"+c.token+"/"+method, bytes.NewReader(body))
+	if err != nil {
+		return false, 0, deliveryFailure(errors.New("telegram: invalid API endpoint"), false)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, 0, ctx.Err()
+		}
+		// net/http errors include the credential-bearing URL. Do not wrap them.
+		return safe, -1, errors.New("telegram: transport failed (delivery may be uncertain)")
+	}
+	return c.decodeResponse(ctx, resp, result, safe)
+}
+
+func (c *Client) decodeResponse(ctx context.Context, resp *http.Response, result any, safe bool) (bool, time.Duration, error) {
+	defer resp.Body.Close()
+	const maxResponse = 8 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, 0, ctx.Err()
+		}
+		return safe, -1, errors.New("telegram: response read failed (delivery may be uncertain)")
+	}
+	if len(data) > maxResponse {
+		return false, 0, errors.New("telegram: response exceeds size limit")
+	}
+	var envelope struct {
+		OK          *bool           `json:"ok"`
+		Result      json.RawMessage `json:"result"`
+		Code        int             `json:"error_code"`
+		Description string          `json:"description"`
+		Parameters  struct {
+			RetryAfter *int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return safe && resp.StatusCode >= 500, -1, fmt.Errorf("telegram: invalid API response (HTTP %d)", resp.StatusCode)
+	}
+	if envelope.OK == nil || !*envelope.OK || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		code := envelope.Code
+		if code == 0 {
+			code = resp.StatusCode
+		}
+		apiErr := &APIError{Code: code, Description: c.sanitize(envelope.Description)}
+		if apiErr.Description == "" {
+			apiErr.Description = "request rejected"
+		}
+		// Only an explicit, complete Telegram rejection proves non-delivery.
+		uncertain := envelope.OK == nil || *envelope.OK || envelope.Code < 400 || envelope.Code > 599 || strings.TrimSpace(envelope.Description) == ""
+		rejection := deliveryFailure(apiErr, uncertain)
+		if code == 429 && !uncertain {
+			apiErr.RetryAfter = 1
+			if envelope.Parameters.RetryAfter != nil {
+				apiErr.RetryAfter = *envelope.Parameters.RetryAfter
+			}
+			// Respect the server's minimum delay; never clamp it and retry early.
+			if apiErr.RetryAfter < 0 || apiErr.RetryAfter > 60 {
+				return false, 0, rejection
+			}
+			return true, time.Duration(apiErr.RetryAfter) * time.Second, rejection
+		}
+		return safe && code >= 500 && code <= 599, -1, rejection
+	}
+	if result != nil {
+		if len(envelope.Result) == 0 || string(envelope.Result) == "null" || json.Unmarshal(envelope.Result, result) != nil {
+			return false, 0, errors.New("telegram: invalid API result")
+		}
+	}
+	return false, 0, nil
+}
+
+var responseURL = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
+
+func (c *Client) sanitize(description string) string {
+	if c.token != "" {
+		for _, secret := range []string{c.token, url.QueryEscape(c.token), url.PathEscape(c.token)} {
+			description = strings.ReplaceAll(description, secret, "[redacted]")
+		}
+	}
+	description = responseURL.ReplaceAllString(description, "[redacted URL]")
+	return strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, description)
+}

@@ -1,0 +1,1122 @@
+package bridge
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf16"
+
+	"omp-telegram/internal/config"
+	"omp-telegram/internal/media"
+	"omp-telegram/internal/omp"
+	"omp-telegram/internal/store"
+	"omp-telegram/internal/telegram"
+)
+
+type Bridge struct {
+	cfg           config.Config
+	db            *store.Store
+	tg            *telegram.Client
+	bot           telegram.User
+	slots         chan struct{}
+	wg            sync.WaitGroup
+	fatal         chan error
+	mediaSlots    chan struct{}
+	resumeSlots   chan struct{}
+	sessionMu     sync.Mutex
+	sessionClaims map[string]sessionClaim
+}
+type incoming struct {
+	id       int64
+	msg      *telegram.Message
+	callback *telegram.CallbackQuery
+}
+type target struct{ chat, thread int64 }
+type queued struct {
+	id        int64
+	user      int64
+	text      string
+	images    []media.Image
+	preparing bool
+	cancel    context.CancelFunc
+	directory string
+}
+type confirmation struct {
+	action, uiID, method string
+	workspace            string
+	options              []string
+	expires              time.Time
+	generation           int64
+	user                 int64
+	sessions             []omp.SessionSummary
+	page                 int
+}
+type worker struct {
+	b              *Bridge
+	key            target
+	input          chan incoming
+	client         *omp.Client
+	binding        store.Binding
+	sessionID      string
+	claimedSession string
+	restoring      bool
+	queue          []queued
+	stream         strings.Builder
+	active         int64
+	owner          int64
+	turn           uint64
+	finishing      bool
+	compacting     bool
+	operations     chan operationResult
+	background     sync.WaitGroup
+	busy           bool
+	toolName       string
+	lastTyping     time.Time
+	preview        string
+	lastPreview    string
+	previewID      int64
+	previewBusy    bool
+	previewResult  chan previewResult
+	confirms       map[string]confirmation
+	mediaResults   chan mediaResult
+	sendResults    chan sendResult
+	hostRequests   map[string]context.CancelFunc
+	resumeResults  chan resumeListResult
+	resumeCancel   context.CancelFunc
+	resumeRequest  uint64
+	ctx            context.Context
+	cancel         context.CancelFunc
+}
+type previewResult struct {
+	id         int64
+	text       string
+	generation int64
+	turn       uint64
+}
+type operationResult struct {
+	generation int64
+	err        error
+}
+type rpcEvent struct {
+	Type                  string                       `json:"type"`
+	ID                    string                       `json:"id"`
+	Method                string                       `json:"method"`
+	TargetID              string                       `json:"targetId"`
+	Arguments             json.RawMessage              `json:"arguments"`
+	Title                 string                       `json:"title"`
+	Message               json.RawMessage              `json:"message"`
+	Options               []string                     `json:"options"`
+	AgentInvoked          *bool                        `json:"agentInvoked"`
+	IsTerminal            *bool                        `json:"isTerminal"`
+	Success               bool                         `json:"success"`
+	Command               string                       `json:"command"`
+	ToolName              string                       `json:"toolName"`
+	AssistantMessageEvent struct{ Type, Delta string } `json:"assistantMessageEvent"`
+	Messages              []message                    `json:"messages"`
+}
+type message struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+var botCommands = []telegram.BotCommand{
+	{Command: "new", Description: "New session: /new <name or project path>"},
+	{Command: "stop", Description: "Stop task and clear queue"},
+	{Command: "close", Description: "Close omp, keep workspace and session"},
+	{Command: "resume", Description: "Choose an omp session in this working directory"},
+	{Command: "status", Description: "Show workspace, model and queue"},
+	{Command: "model", Description: "Show or switch model: /model provider/model"},
+	{Command: "compact", Description: "Compact context after confirmation"},
+	{Command: "help", Description: "Show usage help"},
+	{Command: "start", Description: "Get started and show help"},
+}
+
+func commandHelp() string {
+	var help strings.Builder
+	for i, command := range botCommands {
+		if i > 0 {
+			help.WriteByte('\n')
+		}
+		help.WriteByte('/')
+		help.WriteString(command.Command)
+		help.WriteString(" - ")
+		help.WriteString(command.Description)
+	}
+	return help.String()
+}
+
+func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
+	tg := telegram.New(cfg.Token)
+	bot, err := tg.GetMe(ctx)
+	if err != nil {
+		return err
+	}
+	if err = db.CheckBot(bot.ID); err != nil {
+		return err
+	}
+	// Replace both previously registered lists so all clients receive English descriptions.
+	for _, language := range []string{"", "zh"} {
+		if err = tg.SetCommands(ctx, botCommands, language); err != nil {
+			return fmt.Errorf("register Telegram commands: %w", err)
+		}
+	}
+	log.Print("Telegram command menus registered (English)")
+	b := &Bridge{cfg: cfg, db: db, tg: tg, bot: bot, slots: make(chan struct{}, cfg.MaxWorkers), fatal: make(chan error, 1), mediaSlots: make(chan struct{}, 2), resumeSlots: make(chan struct{}, 2)}
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() { cancel(); b.wg.Wait() }()
+	workers := map[target]*worker{}
+	if err := b.restoreWorkers(ctx, workers); err != nil {
+		return err
+	}
+	b.wg.Add(2)
+	go func() {
+		defer b.wg.Done()
+		if err := b.deliver(ctx); err != nil {
+			b.fail(err)
+		}
+	}()
+	wake := make(chan struct{}, 1)
+	go func() {
+		defer b.wg.Done()
+		for ctx.Err() == nil {
+			offset, err := db.Offset()
+			if err != nil {
+				b.fail(err)
+				return
+			}
+			updates, err := tg.GetUpdates(ctx, offset)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("Telegram polling failed: %v; retrying", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			for _, u := range updates {
+				raw, err := json.Marshal(u)
+				if err == nil {
+					err = db.Accept(u.UpdateID, raw)
+				}
+				if err != nil {
+					b.fail(err)
+					return
+				}
+			}
+			select {
+			case wake <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	delivered := map[int64]bool{}
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		inputs, err := db.Pending()
+		if err != nil {
+			return err
+		}
+		pendingIDs := make(map[int64]bool, len(inputs))
+		for _, in := range inputs {
+			pendingIDs[in.ID] = true
+		}
+		for id := range delivered {
+			if !pendingIDs[id] {
+				delete(delivered, id)
+			}
+		}
+		for _, in := range inputs {
+			if delivered[in.ID] {
+				continue
+			}
+			var u telegram.Update
+			if json.Unmarshal(in.Raw, &u) != nil {
+				if err = db.Mark(in.ID, "ignored"); err != nil {
+					return err
+				}
+				continue
+			}
+			m := u.Message
+			var user int64
+			if m != nil && m.From != nil {
+				user = m.From.ID
+			}
+			if u.CallbackQuery != nil {
+				m = u.CallbackQuery.Message
+				user = u.CallbackQuery.From.ID
+			}
+			if m == nil || !cfg.Authorized(user, m.Chat.ID) {
+				if err = db.Mark(in.ID, "ignored"); err != nil {
+					return err
+				}
+				continue
+			}
+			if m.MessageThreadID == 0 {
+				if err = db.Enqueue(m.Chat.ID, 0, "Use /new <name or project path> inside an existing topic."); err != nil {
+					return err
+				}
+				if err = db.Mark(in.ID, "done"); err != nil {
+					return err
+				}
+				continue
+			}
+			key := target{m.Chat.ID, m.MessageThreadID}
+			w := workers[key]
+			if w == nil {
+				w = b.launchWorker(ctx, key, store.Binding{}, false)
+				workers[key] = w
+			}
+			select {
+			case w.input <- incoming{in.ID, m, u.CallbackQuery}:
+				delivered[in.ID] = true
+			default:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-b.fatal:
+			return err
+		case <-wake:
+		case <-tick.C:
+		}
+	}
+}
+
+func (b *Bridge) deliver(ctx context.Context) error {
+	for ctx.Err() == nil {
+		o, e := b.db.NextOutput()
+		if errors.Is(e, sql.ErrNoRows) {
+			select {
+			case <-ctx.Done():
+			case <-time.After(200 * time.Millisecond):
+			}
+			continue
+		}
+		if e != nil {
+			log.Print("outbox read failed")
+			return e
+		}
+		if e = b.db.MarkOutput(o.ID, "sending"); e != nil {
+			return e
+		}
+		switch o.Kind {
+		case "text":
+			_, e = b.tg.Send(ctx, o.Chat, o.Thread, o.Text, nil)
+		case "photo", "document":
+			_, e = b.tg.SendFile(ctx, o.Chat, o.Thread, o.Kind, o.Path, o.Name, o.Text)
+		default:
+			return errors.New("unsupported outbox content kind")
+		}
+		state := "done"
+		if e != nil {
+			state = "failed"
+			if telegram.DeliveryUncertain(e) {
+				state = "uncertain"
+			}
+			log.Printf("Telegram delivery %s: %v; not replaying automatically", state, e)
+		}
+		if e = b.db.MarkOutput(o.ID, state); e != nil {
+			return e
+		}
+		if o.Kind != "text" {
+			if state == "done" {
+				_ = os.Remove(o.Path)
+			} else {
+				if e = b.db.Enqueue(o.Chat, o.Thread, "Attachment delivery "+state+". It will not be replayed automatically."); e != nil {
+					return e
+				}
+			}
+		}
+	}
+	return nil
+}
+func (b *Bridge) fail(err error) {
+	select {
+	case b.fatal <- err:
+	default:
+	}
+}
+func (w *worker) say(s string) {
+	for _, part := range split(s, 3800) {
+		if e := w.b.db.Enqueue(w.key.chat, w.key.thread, part); e != nil {
+			log.Print("outbox write failed; stopping worker")
+			w.b.fail(e)
+			w.cancel()
+			return
+		}
+	}
+}
+func (w *worker) mark(id int64, state string) bool {
+	if id == 0 {
+		return true
+	}
+	if e := w.b.db.Mark(id, state); e != nil {
+		w.b.fail(e)
+		w.cancel()
+		return false
+	}
+	return true
+}
+func (w *worker) run() {
+	w.initMedia()
+	w.initResumePicker()
+	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults() }()
+	defer w.shutdown()
+	if w.restoring {
+		w.start(true, w.binding.Session, w.binding.Workspace)
+		w.restoring = false
+	}
+	tick := time.NewTicker(1500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var events <-chan json.RawMessage
+		var done <-chan struct{}
+		if w.client != nil {
+			events = w.client.Events()
+			done = w.client.Done()
+		}
+		select {
+		case <-w.ctx.Done():
+			return
+		case in := <-w.input:
+			w.handle(in)
+		case raw, ok := <-events:
+			if !ok {
+				w.failed()
+				continue
+			}
+			w.event(raw)
+		case <-done:
+			w.failed()
+		case result := <-w.previewResult:
+			w.previewBusy = false
+			if result.generation == w.binding.Generation && result.turn == w.turn {
+				w.previewID = result.id
+				w.lastPreview = result.text
+			}
+			if w.finishing {
+				w.finish()
+			}
+		case result := <-w.operations:
+			if result.generation == w.binding.Generation && w.client != nil {
+				w.compacting = false
+				w.busy = false
+				if result.err != nil {
+					w.say("Compaction failed.")
+				} else {
+					w.say("Compaction completed.")
+				}
+			}
+		case result := <-w.mediaResults:
+			w.preparedMedia(result)
+		case result := <-w.sendResults:
+			w.preparedSend(result)
+		case result := <-w.resumeResults:
+			w.resumeListed(result)
+		case <-tick.C:
+			w.typing()
+			w.flushPreview()
+			w.expire()
+		}
+		w.dispatch()
+	}
+}
+func (w *worker) shutdown() {
+	if !w.restoring && w.ctx.Err() == nil {
+		w.persistClosed()
+	}
+	w.cancelResumeList()
+	for _, q := range w.queue {
+		if q.cancel != nil {
+			q.cancel()
+		}
+	}
+	for id, cancel := range w.hostRequests {
+		cancel()
+		delete(w.hostRequests, id)
+	}
+	w.toolName = ""
+	w.turn++
+	w.finishing = false
+	w.compacting = false
+	w.preview = ""
+	w.stream.Reset()
+	w.confirms = map[string]confirmation{}
+	if w.client != nil {
+		w.client.Close()
+		w.client = nil
+		<-w.b.slots
+	}
+	w.releaseSession()
+	if w.active != 0 {
+		w.mark(w.active, "uncertain")
+	}
+}
+func (w *worker) failed() {
+	w.say("omp exited. The task outcome is uncertain and will not be replayed automatically. Use /resume to restore the session.")
+	w.shutdown()
+	w.busy = false
+	w.active = 0
+	w.clearQueue()
+}
+func (w *worker) clearQueue() {
+	for _, q := range w.queue {
+		if q.cancel != nil {
+			q.cancel()
+		}
+		removeIncoming(w.binding.Workspace, q.directory)
+		w.mark(q.id, "cancelled")
+	}
+	w.queue = nil
+}
+func (w *worker) call(kind string, fields map[string]any) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	defer cancel()
+	return w.client.Call(ctx, kind, fields)
+}
+
+func (w *worker) newWorkspace(arg string) (string, error) {
+	if arg != "" {
+		return resolveWorkspace(w.b.cfg.WorkspaceRoot, arg)
+	}
+	old, err := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && old.Workspace == "" {
+		return "", errors.New("First use requires /new <name or project path>.")
+	}
+	if err != nil {
+		return "", errors.New("Failed to read the session binding.")
+	}
+	if !filepath.IsAbs(old.Workspace) {
+		return "", errors.New("Cannot determine the working directory. Use /new <name or project path>.")
+	}
+	return old.Workspace, nil
+}
+
+func (w *worker) start(resume bool, target, expectedCWD string) {
+	if w.client != nil {
+		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
+		return
+	}
+	old, e := w.b.db.Binding(w.b.bot.ID, w.key.chat, w.key.thread)
+	if e != nil && !errors.Is(e, sql.ErrNoRows) {
+		w.say("Failed to read the session.")
+		return
+	}
+	var cwd, session string
+	if resume {
+		if w.restoring {
+			info, err := os.Stat(target)
+			if !filepath.IsAbs(target) || err != nil || !info.Mode().IsRegular() || !filepath.IsAbs(expectedCWD) {
+				w.say("Cannot restore the saved omp session. Its session file or working directory is unavailable. No replacement session was created; use /resume to select a session.")
+				return
+			}
+			cwd = expectedCWD
+		} else if !validSessionID(target) {
+			w.say("Usage: /resume, or /resume <omp session ID>.")
+			return
+		}
+		if w.b.sessionInUse(target) {
+			w.say("This session is already running in another topic. Close that instance first, or use a full session ID.")
+			return
+		}
+		session = target
+	} else {
+		cwd = target
+		if !filepath.IsAbs(cwd) {
+			w.say("Invalid working directory.")
+			return
+		}
+	}
+	select {
+	case w.b.slots <- struct{}{}:
+	default:
+		w.say("The active instance limit has been reached.")
+		return
+	}
+	if !resume {
+		if e = os.MkdirAll(cwd, 0700); e != nil {
+			<-w.b.slots
+			w.say("Failed to create the working directory.")
+			return
+		}
+	}
+	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs})
+	if e != nil {
+		<-w.b.slots
+		if resume {
+			w.say("Failed to resume omp. Check the session ID, original directory, and omp configuration.")
+		} else {
+			w.say("Failed to start omp. Check the executable and local configuration.")
+		}
+		return
+	}
+	w.client = c
+	w.initMedia()
+	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
+	info, e := c.SessionInfo(ctx)
+	cancel()
+	if e != nil {
+		w.shutdown()
+		w.say("Cannot obtain omp session identity and working directory. The instance has been closed.")
+		return
+	}
+	if resume && !w.restoring && !strings.HasPrefix(strings.ToLower(info.ID), strings.ToLower(target)) {
+		w.shutdown()
+		w.say("The resumed session did not match the requested omp session ID.")
+		return
+	}
+	if w.restoring && !sameSessionFile(info.File, target) {
+		w.shutdown()
+		w.say("omp did not restore the saved session file. The instance has been closed.")
+		return
+	}
+	if !resume {
+		expectedCWD = cwd
+	}
+	if expectedCWD != "" && !sameWorkspace(info.CWD, expectedCWD) {
+		w.shutdown()
+		w.say("omp selected a different working directory. The instance has been closed.")
+		return
+	}
+	if !w.claimSession(info.File, info.ID) {
+		w.shutdown()
+		w.say("This omp session is already active in another topic.")
+		return
+	}
+	if _, e = w.call("set_host_tools", map[string]any{"tools": telegramSendTools}); e != nil {
+		w.shutdown()
+		w.say("Cannot register Telegram attachment delivery. The instance has been closed.")
+		return
+	}
+	w.binding = store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, Generation: old.Generation + 1, Running: true}
+	if e = w.b.db.Save(w.binding); e != nil {
+		w.shutdown()
+		w.say("Failed to save the session binding. The instance has been closed.")
+		return
+	}
+	w.preview, w.lastPreview = "", ""
+	w.previewID = 0
+	w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
+	if w.restoring {
+		w.say("The previous session was restored after service restart. Interrupted tasks and previously queued prompts were not resubmitted.")
+	}
+}
+func (w *worker) handle(in incoming) {
+	if in.callback != nil {
+		if !w.mark(in.id, "submitted") {
+			return
+		}
+		w.callback(in.callback)
+		w.mark(in.id, "done")
+		return
+	}
+	text := strings.TrimSpace(in.msg.Text)
+	hasAttachment := len(in.msg.Photo) != 0 || in.msg.Document != nil
+	if hasAttachment {
+		text = strings.TrimSpace(in.msg.Caption)
+	}
+	if text == "" && !hasAttachment {
+		w.mark(in.id, "ignored")
+		return
+	}
+	if hasAttachment || !strings.HasPrefix(text, "/") {
+		if w.client == nil {
+			w.say("No instance is running in this topic. Start with /new <name or project path>, or use /resume for a saved session.")
+			w.mark(in.id, "done")
+			return
+		}
+		if len(w.queue) >= w.b.cfg.QueueCapacity {
+			w.say("The queue is full. This message was not submitted.")
+			w.mark(in.id, "cancelled")
+			return
+		}
+		if hasAttachment {
+			w.queueMedia(in)
+		} else {
+			w.queue = append(w.queue, queued{id: in.id, user: in.msg.From.ID, text: text})
+		}
+		return
+	}
+	if !w.mark(in.id, "submitted") {
+		return
+	}
+	defer w.mark(in.id, "done")
+	fields := strings.Fields(text)
+	cmd := fields[0]
+	if name, bot, ok := strings.Cut(cmd, "@"); ok {
+		if !strings.EqualFold(bot, w.b.bot.Username) {
+			return
+		}
+		cmd = name
+	}
+	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+	switch cmd {
+	case "/help", "/start":
+		w.say(commandHelp())
+	case "/new":
+		workspace, err := w.newWorkspace(arg)
+		if err != nil {
+			w.say(err.Error())
+			return
+		}
+		if w.client != nil {
+			w.confirm(confirmation{action: "new", workspace: workspace, user: in.msg.From.ID}, "Start a new omp session in: "+workspace+"?\nExisting files and session history will be preserved.", []string{"Confirm", "Cancel"})
+		} else {
+			w.start(false, workspace, "")
+		}
+	case "/resume":
+		if arg == "" {
+			w.requestResumeList(in.msg.From.ID)
+		} else {
+			w.start(true, arg, "")
+		}
+	case "/close":
+		if !w.persistClosed() {
+			return
+		}
+		w.clearQueue()
+		w.shutdown()
+		w.active = 0
+		w.busy = false
+		w.confirms = map[string]confirmation{}
+		w.say("The instance is closed. The session has been preserved.")
+	case "/stop":
+		w.clearQueue()
+		if w.client != nil {
+			if _, e := w.call("abort", nil); e != nil {
+				w.say("The abort request failed.")
+				return
+			}
+		}
+		w.say("Abort requested and queued prompts cleared.")
+	case "/status":
+		w.status()
+	case "/model":
+		if w.client == nil {
+			w.say("No instance is running.")
+			return
+		}
+		if arg == "" {
+			w.status()
+			return
+		}
+		if w.busy {
+			w.say("Wait for the current task to finish before switching models.")
+			return
+		}
+		provider, model, ok := strings.Cut(arg, "/")
+		if !ok || provider == "" || model == "" {
+			w.say("Usage: /model provider/model")
+			return
+		}
+		if _, e := w.call("set_model", map[string]any{"provider": provider, "modelId": model}); e != nil {
+			w.say("Failed to switch models.")
+		} else {
+			w.say("Model switched.")
+		}
+	case "/compact":
+		if w.client == nil || w.busy {
+			w.say("An idle instance is required.")
+			return
+		}
+		w.confirm(confirmation{action: "compact", user: in.msg.From.ID}, "Compact the current session?", []string{"Confirm", "Cancel"})
+	default:
+		w.say("Unsupported command. Use /help.")
+	}
+}
+func (w *worker) status() {
+	if w.client == nil {
+		n, _ := w.b.db.Uncertain()
+		w.say(fmt.Sprintf("No instance is running. Global uncertain records: %d. Use /resume to restore a session; tasks are not replayed automatically.", n))
+		return
+	}
+	raw, e := w.call("get_state", nil)
+	if e != nil {
+		w.say("Failed to read the session state.")
+		return
+	}
+	var s struct {
+		Model        struct{ Provider, ID string }
+		IsStreaming  bool `json:"isStreaming"`
+		IsCompacting bool `json:"isCompacting"`
+	}
+	if json.Unmarshal(raw, &s) != nil {
+		return
+	}
+	w.say(fmt.Sprintf("Workspace: %s\nSession: %s\nModel: %s/%s\nRunning: %t\nCompacting: %t\nQueued: %d", w.binding.Workspace, w.sessionID, s.Model.Provider, s.Model.ID, s.IsStreaming, s.IsCompacting, len(w.queue)))
+}
+func (w *worker) dispatch() {
+	if w.client == nil || w.busy || w.compacting || len(w.queue) == 0 {
+		return
+	}
+	if w.queue[0].preparing {
+		return
+	}
+	q := w.queue[0]
+	w.queue = w.queue[1:]
+	if !w.mark(q.id, "submitted") {
+		return
+	}
+	w.active = q.id
+	w.owner = q.user
+	w.turn++
+	w.busy = true
+	w.preview = ""
+	w.stream.Reset()
+	w.lastPreview = ""
+	w.previewID = 0
+	fields := map[string]any{"message": q.text}
+	if len(q.images) > 0 {
+		fields["images"] = q.images
+	}
+	raw, e := w.call("prompt", fields)
+	if e != nil {
+		w.say("Submission failed or its outcome is uncertain. It will not be replayed automatically.")
+		w.mark(q.id, "uncertain")
+		w.shutdown()
+		w.clearQueue()
+		w.active = 0
+		w.busy = false
+		return
+	}
+	var r struct {
+		AgentInvoked *bool `json:"agentInvoked"`
+	}
+	if json.Unmarshal(raw, &r) == nil && r.AgentInvoked != nil && !*r.AgentInvoked {
+		w.finish()
+	}
+}
+func (w *worker) finish() {
+	if w.previewBusy {
+		w.finishing = true
+		return
+	}
+	w.finishing = false
+	w.toolName = ""
+	if w.active != 0 {
+		text := w.preview
+		if text == "" {
+			text = "The task has ended without text output."
+		}
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, w.active, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
+			if w.ctx.Err() == nil {
+				log.Print("final result commit failed; stopping worker")
+				w.b.fail(err)
+				w.cancel()
+			}
+			return
+		}
+	} else if w.preview != "" {
+		w.say(w.preview)
+	}
+	w.active = 0
+	w.busy = false
+	w.preview = ""
+	w.stream.Reset()
+	w.confirms = map[string]confirmation{}
+	if w.previewID != 0 {
+		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+		_ = w.b.tg.Edit(ctx, w.key.chat, w.previewID, "Preview ended. The complete result follows.", nil)
+		cancel()
+	}
+}
+func (w *worker) event(raw []byte) {
+	var e rpcEvent
+	if json.Unmarshal(raw, &e) != nil {
+		return
+	}
+	switch e.Type {
+	case "host_tool_call":
+		w.hostSend(e)
+	case "host_tool_cancel":
+		if cancel, ok := w.hostRequests[e.TargetID]; ok {
+			cancel()
+			delete(w.hostRequests, e.TargetID)
+		}
+	case "tool_execution_start":
+		w.toolName = e.ToolName
+	case "tool_execution_end":
+		w.toolName = ""
+	case "message_update":
+		if e.AssistantMessageEvent.Type == "text_delta" {
+			w.stream.WriteString(e.AssistantMessageEvent.Delta)
+			w.preview = w.stream.String()
+		}
+	case "auto_compaction_start":
+		w.compacting = true
+	case "auto_compaction_end":
+		w.compacting = false
+	case "agent_start":
+		w.busy = true
+	case "agent_end":
+		if e.IsTerminal != nil && !*e.IsTerminal {
+			return
+		}
+		var texts []string
+		for _, m := range e.Messages {
+			if m.Role == "assistant" {
+				var blocks []struct{ Type, Text string }
+				if json.Unmarshal(m.Content, &blocks) == nil {
+					for _, c := range blocks {
+						if c.Type == "text" && c.Text != "" {
+							texts = append(texts, c.Text)
+						}
+					}
+				}
+			}
+		}
+		if len(texts) > 0 {
+			w.preview = strings.Join(texts, "\n\n")
+		}
+		w.finish()
+	case "prompt_result":
+		if e.AgentInvoked != nil && !*e.AgentInvoked {
+			w.finish()
+		}
+	case "response":
+		if !e.Success {
+			w.say("The omp request failed. Use /status to check the session state.")
+			w.mark(w.active, "uncertain")
+			w.shutdown()
+			w.clearQueue()
+			w.active = 0
+			w.busy = false
+		}
+	case "extension_ui_request":
+		w.ui(e)
+	}
+}
+func (w *worker) typing() {
+	preparing := len(w.queue) > 0 && w.queue[0].preparing
+	if (!w.busy && !preparing) || time.Since(w.lastTyping) < 5*time.Second {
+		return
+	}
+	w.lastTyping = time.Now()
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(w.ctx, 4*time.Second)
+		defer cancel()
+		_ = w.b.tg.Typing(ctx, w.key.chat, w.key.thread)
+	}()
+}
+
+func (w *worker) flushPreview() {
+	snapshot := w.preview
+	if w.toolName != "" {
+		snapshot = "Running tool: " + w.toolName
+	}
+	if !w.busy || w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
+		return
+	}
+	text := split(snapshot, 3500)[0] + "\n[Generating]"
+	id := w.previewID
+	gen := w.binding.Generation
+	turn := w.turn
+	w.previewBusy = true
+	w.background.Add(1)
+	go func() {
+		defer w.background.Done()
+		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+		defer cancel()
+		if id == 0 {
+			m, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, text, nil)
+			if e == nil {
+				id = m.MessageID
+			}
+		} else {
+			_ = w.b.tg.Edit(ctx, w.key.chat, id, text, nil)
+		}
+		select {
+		case w.previewResult <- previewResult{id, snapshot, gen, turn}:
+		case <-w.ctx.Done():
+		}
+	}()
+}
+func (w *worker) confirm(c confirmation, title string, options []string) {
+	parts := split(title, 3800)
+	if len(parts) == 0 {
+		title = "Confirmation required"
+	} else {
+		title = parts[0]
+	}
+	var data [12]byte
+	if _, e := rand.Read(data[:]); e != nil {
+		return
+	}
+	token := hex.EncodeToString(data[:])
+	c.expires = time.Now().Add(2 * time.Minute)
+	c.generation = w.binding.Generation
+	if c.user == 0 {
+		c.user = w.owner
+	}
+	w.confirms[token] = c
+	k := &telegram.Keyboard{}
+	for i, label := range options {
+		k.InlineKeyboard = append(k.InlineKeyboard, []telegram.Button{{Text: label, CallbackData: fmt.Sprintf("%s:%d", token, i)}})
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+	if _, e := w.b.tg.Send(ctx, w.key.chat, w.key.thread, title, k); e != nil {
+		delete(w.confirms, token)
+		w.cancelUI(c)
+		w.say("Failed to send the confirmation. The operation was canceled.")
+	}
+}
+func (w *worker) callback(q *telegram.CallbackQuery) {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	token, index, ok := strings.Cut(q.Data, ":")
+	c, exists := w.confirms[token]
+	if !ok || !exists || time.Now().After(c.expires) || c.generation != w.binding.Generation || c.user != q.From.ID {
+		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
+		return
+	}
+	n, err := strconv.Atoi(index)
+	if err != nil || n < 0 || (c.method != "select" && n > 1) || (c.method == "select" && n > len(c.options)) {
+		return
+	}
+	delete(w.confirms, token)
+	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
+	if c.action == "resume" {
+		var messageID int64
+		if q.Message != nil {
+			messageID = q.Message.MessageID
+		}
+		w.selectResume(c, n, messageID)
+		return
+	}
+	if c.action == "ui" {
+		frame := map[string]any{"type": "extension_ui_response", "id": c.uiID}
+		if c.method == "confirm" {
+			frame["confirmed"] = n == 0
+		} else if n >= 0 && n < len(c.options) {
+			frame["value"] = c.options[n]
+		} else {
+			frame["cancelled"] = true
+		}
+		if w.client != nil {
+			_ = w.client.Send(ctx, frame)
+		}
+		return
+	}
+	if n != 0 {
+		return
+	}
+	switch c.action {
+	case "new":
+		if !filepath.IsAbs(c.workspace) {
+			w.say("Invalid working directory. The existing instance is still running.")
+			return
+		}
+		if err := os.MkdirAll(c.workspace, 0700); err != nil {
+			w.say("Cannot create the working directory. The existing instance is still running.")
+			return
+		}
+		w.clearQueue()
+		w.shutdown()
+		w.active = 0
+		w.busy = false
+		w.confirms = map[string]confirmation{}
+		w.start(false, c.workspace, "")
+	case "compact":
+		if w.client == nil || w.busy {
+			w.say("The instance is not idle. Compaction was canceled.")
+			return
+		}
+		w.busy = true
+		w.compacting = true
+		client := w.client
+		generation := w.binding.Generation
+		w.background.Add(1)
+		go func() {
+			defer w.background.Done()
+			_, err := client.Call(w.ctx, "compact", nil)
+			select {
+			case w.operations <- operationResult{generation, err}:
+			case <-w.ctx.Done():
+			}
+		}()
+	}
+}
+func (w *worker) ui(e rpcEvent) {
+	switch e.Method {
+	case "confirm", "select":
+		var msg string
+		_ = json.Unmarshal(e.Message, &msg)
+		c := confirmation{action: "ui", uiID: e.ID, method: e.Method, options: e.Options}
+		options := e.Options
+		if e.Method == "confirm" {
+			options = []string{"Confirm", "Cancel"}
+		} else if len(options) == 0 || len(options) > 20 {
+			w.cancelUI(c)
+			w.say("The number of options is unsupported. The dialog was canceled.")
+			return
+		}
+		if e.Method == "select" {
+			options = append(append([]string(nil), options...), "Cancel")
+		}
+		w.confirm(c, e.Title+"\n"+msg, options)
+	case "input", "editor":
+		w.cancelUI(confirmation{uiID: e.ID})
+		w.say("Input dialogs are not supported and have been canceled. Provide the information in a normal message.")
+	case "cancel":
+		for token, c := range w.confirms {
+			if c.uiID == e.TargetID {
+				delete(w.confirms, token)
+			}
+		}
+	}
+}
+func (w *worker) cancelUI(c confirmation) {
+	if c.uiID != "" && w.client != nil {
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+		defer cancel()
+		_ = w.client.Send(ctx, map[string]any{"type": "extension_ui_response", "id": c.uiID, "cancelled": true})
+	}
+}
+func (w *worker) expire() {
+	for token, c := range w.confirms {
+		if time.Now().After(c.expires) {
+			delete(w.confirms, token)
+			w.cancelUI(c)
+		}
+	}
+}
+func split(s string, limit int) []string {
+	var out []string
+	start, n := 0, 0
+	for i, r := range s {
+		size := utf16.RuneLen(r)
+		if size < 0 {
+			size = 1
+		}
+		if n+size > limit {
+			out = append(out, s[start:i])
+			start = i
+			n = 0
+		}
+		n += size
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
+}

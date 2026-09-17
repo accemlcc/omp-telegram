@@ -1,0 +1,430 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+)
+
+func openTestStore(t *testing.T, dir string) *Store {
+	t.Helper()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func requireStoreOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaVersionSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	if version != schemaVersion {
+		t.Fatalf("new database version = %d, want %d", version, schemaVersion)
+	}
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	pending, err := s.Pending()
+	requireStoreOK(t, err)
+	if len(pending) != 1 || pending[0].ID != 10 {
+		t.Fatal("reopening the current schema lost existing input")
+	}
+}
+
+func TestUnsupportedSchemaLeavesDataUntouched(t *testing.T) {
+	for name, version := range map[string]int{"unversioned": 0, "future": schemaVersion + 1} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+			requireStoreOK(t, err)
+			defer db.Close()
+			_, err = db.Exec("CREATE TABLE saved(value TEXT); INSERT INTO saved VALUES('keep'); PRAGMA user_version=" + strconv.Itoa(version))
+			requireStoreOK(t, err)
+			if s, err := Open(dir); err == nil {
+				s.Close()
+				t.Fatal("unsupported database was accepted")
+			}
+			var value string
+			var actual, objects int
+			requireStoreOK(t, db.QueryRow("SELECT value FROM saved").Scan(&value))
+			requireStoreOK(t, db.QueryRow("PRAGMA user_version").Scan(&actual))
+			requireStoreOK(t, db.QueryRow("SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'").Scan(&objects))
+			if value != "keep" || actual != version || objects != 1 {
+				t.Fatalf("rejected database was modified: value=%q version=%d objects=%d", value, actual, objects)
+			}
+		})
+	}
+}
+
+func TestCompletionRollsBackEveryReplyAndInputState(t *testing.T) {
+	for name, trigger := range map[string]string{
+		"reply-write":  `CREATE TRIGGER reject_reply BEFORE INSERT ON outbox WHEN NEW.text='second' BEGIN SELECT RAISE(FAIL,'injected reply failure'); END`,
+		"input-update": `CREATE TRIGGER reject_done BEFORE UPDATE OF state ON inbox WHEN NEW.state='done' BEGIN SELECT RAISE(FAIL,'injected completion failure'); END`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t, t.TempDir())
+			requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+			requireStoreOK(t, s.Mark(10, "submitted"))
+			_, err := s.DB.Exec(trigger)
+			requireStoreOK(t, err)
+			if err := s.CompleteInboxWithReplies(context.Background(), 10, 1, 2, []string{"first", "second"}); err == nil {
+				t.Fatal("completion ignored a persistence failure")
+			}
+			var state string
+			requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+			if state != "submitted" {
+				t.Fatalf("failed completion changed input to %q", state)
+			}
+			if _, err := s.NextOutput(); err != sql.ErrNoRows {
+				t.Fatalf("failed completion left a deliverable reply: %v", err)
+			}
+		})
+	}
+}
+
+func TestCompletionSurvivesRestartWithOrderedReplies(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Mark(10, "submitted"))
+	requireStoreOK(t, s.CompleteInboxWithReplies(context.Background(), 10, 1, 2, []string{"first", "second"}))
+	if err := s.CompleteInboxWithReplies(context.Background(), 10, 1, 2, []string{"duplicate"}); err == nil {
+		t.Fatal("already completed input accepted a second result")
+	}
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	var state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state))
+	if state != "done" {
+		t.Fatalf("committed completion became %q after restart", state)
+	}
+	for _, expected := range []string{"first", "second"} {
+		out, err := s.NextOutput()
+		requireStoreOK(t, err)
+		if out.Text != expected {
+			t.Fatalf("next reply = %q, want %q", out.Text, expected)
+		}
+		requireStoreOK(t, s.MarkOutput(out.ID, "done"))
+	}
+	if _, err := s.NextOutput(); err != sql.ErrNoRows {
+		t.Fatalf("duplicate reply became deliverable: %v", err)
+	}
+}
+
+func TestRestartRecovery(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Accept(10, []byte(`{"update_id":10}`)))
+	requireStoreOK(t, s.Accept(11, []byte(`{"update_id":11}`)))
+	requireStoreOK(t, s.Mark(11, "submitted"))
+	requireStoreOK(t, s.Enqueue(1, 2, "possibly delivered"))
+	first, err := s.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutput(first.ID, "sending"))
+	requireStoreOK(t, s.Enqueue(1, 2, "not sent"))
+	requireStoreOK(t, s.Close())
+
+	s = openTestStore(t, dir)
+	pending, err := s.Pending()
+	requireStoreOK(t, err)
+	if len(pending) != 1 || pending[0].ID != 10 || string(pending[0].Raw) != `{"update_id":10}` {
+		t.Fatalf("pending after restart: %+v", pending)
+	}
+	n, err := s.Uncertain()
+	requireStoreOK(t, err)
+	if n != 2 {
+		t.Fatalf("uncertain = %d, want submitted input and sending output", n)
+	}
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	if out.Text != "not sent" || out.Chat != 1 || out.Thread != 2 {
+		t.Fatalf("replayed uncertain output: %+v", out)
+	}
+	requireStoreOK(t, s.MarkOutput(out.ID, "sent"))
+	if _, err = s.NextOutput(); err != sql.ErrNoRows {
+		t.Fatalf("uncertain output became deliverable: %v", err)
+	}
+	requireStoreOK(t, s.Accept(11, []byte(`{"duplicate":true}`)))
+	pending, err = s.Pending()
+	requireStoreOK(t, err)
+	if len(pending) != 1 || pending[0].ID != 10 {
+		t.Fatalf("duplicate revived uncertain input: %+v", pending)
+	}
+}
+
+func TestAttachmentRestartRecovery(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.EnqueueAttachment(1, 2, "photo", "/spool/photo", "picture.png", "possibly delivered"))
+	first, err := s.NextOutput()
+	requireStoreOK(t, err)
+	requireStoreOK(t, s.MarkOutput(first.ID, "sending"))
+	want := Output{ID: first.ID + 1, Chat: 3, Thread: 4, Kind: "document", Path: "/spool/document", Name: "report.pdf", Text: "report caption"}
+	requireStoreOK(t, s.EnqueueAttachment(want.Chat, want.Thread, want.Kind, want.Path, want.Name, want.Text))
+	requireStoreOK(t, s.Close())
+
+	s = openTestStore(t, dir)
+	out, err := s.NextOutput()
+	requireStoreOK(t, err)
+	if out != want {
+		t.Fatalf("staged attachment after restart = %+v, want %+v", out, want)
+	}
+	n, err := s.Uncertain()
+	requireStoreOK(t, err)
+	if n != 1 {
+		t.Fatalf("uncertain attachments = %d, want 1", n)
+	}
+	var state string
+	requireStoreOK(t, s.DB.QueryRow("SELECT state FROM outbox WHERE id=?", first.ID).Scan(&state))
+	if state != "uncertain" {
+		t.Fatalf("in-flight attachment state = %q", state)
+	}
+	requireStoreOK(t, s.MarkOutput(out.ID, "sent"))
+	if _, err = s.NextOutput(); err != sql.ErrNoRows {
+		t.Fatalf("ambiguous attachment was replayed: %v", err)
+	}
+}
+
+func TestRejectUnsupportedAttachmentKind(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	for _, kind := range []string{"", "text", "voice", "PHOTO"} {
+		if err := s.EnqueueAttachment(1, 2, kind, "/spool/file", "file", "caption"); err == nil {
+			t.Fatalf("accepted attachment kind %q", kind)
+		}
+	}
+	if out, err := s.NextOutput(); err != sql.ErrNoRows {
+		t.Fatalf("invalid attachment entered outbox: %+v, %v", out, err)
+	}
+}
+
+func TestAcceptAtomicDedupAndOffset(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	requireStoreOK(t, s.Accept(20, []byte(`{"original":true}`)))
+	requireStoreOK(t, s.Accept(20, []byte(`{"replacement":true}`)))
+	requireStoreOK(t, s.Accept(19, []byte(`{}`)))
+	pending, err := s.Pending()
+	requireStoreOK(t, err)
+	if len(pending) != 2 || pending[1].ID != 20 || string(pending[1].Raw) != `{"original":true}` {
+		t.Fatalf("dedup changed original input: %+v", pending)
+	}
+	offset, err := s.Offset()
+	requireStoreOK(t, err)
+	if offset != 21 {
+		t.Fatalf("offset regressed: %d", offset)
+	}
+	if err = s.Accept(30, nil); err == nil {
+		t.Fatal("accepted input without durable payload")
+	}
+	offset, err = s.Offset()
+	requireStoreOK(t, err)
+	if offset != 21 {
+		t.Fatalf("failed payload advanced offset: %d", offset)
+	}
+	_, err = s.DB.Exec(`CREATE TRIGGER reject_offset BEFORE UPDATE ON meta WHEN NEW.key='offset' BEGIN SELECT RAISE(ABORT,'offset failure'); END`)
+	requireStoreOK(t, err)
+	if err = s.Accept(40, []byte(`{}`)); err == nil {
+		t.Fatal("accepted input despite offset write failure")
+	}
+	pending, err = s.Pending()
+	requireStoreOK(t, err)
+	if len(pending) != 2 {
+		t.Fatalf("offset failure left partially committed input: %+v", pending)
+	}
+}
+
+func TestBotIdentitySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.CheckBot(42))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	if err := s.CheckBot(43); err == nil {
+		t.Fatal("accepted a different bot's data directory")
+	}
+	requireStoreOK(t, s.CheckBot(42))
+}
+
+func TestLatestBindingAndHistorySurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/first", Session: "/sessions/first.jsonl", Generation: 1}
+	second := first
+	second.Workspace, second.Session, second.Generation = "/workspaces/second", "/sessions/second.jsonl", 2
+	third := second
+	third.Session, third.Generation = "/sessions/third.jsonl", 3
+	other := Binding{Bot: 1, Chat: 2, Thread: 4, Workspace: "/workspaces/other", Session: "/sessions/other.jsonl", Generation: 1}
+	for _, b := range []Binding{first, other, second, third} {
+		requireStoreOK(t, s.Save(b))
+	}
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	for _, want := range []Binding{third, other} {
+		got, err := s.Binding(want.Bot, want.Chat, want.Thread)
+		requireStoreOK(t, err)
+		if got != want {
+			t.Fatalf("restored %+v, want %+v", got, want)
+		}
+	}
+	rows, err := s.DB.Query("SELECT bot,chat,thread,workspace,session,generation FROM history ORDER BY generation")
+	requireStoreOK(t, err)
+	defer rows.Close()
+	for _, want := range []Binding{first, second} {
+		if !rows.Next() {
+			t.Fatalf("lost historical binding %+v: %v", want, rows.Err())
+		}
+		var got Binding
+		requireStoreOK(t, rows.Scan(&got.Bot, &got.Chat, &got.Thread, &got.Workspace, &got.Session, &got.Generation))
+		if got != want {
+			t.Fatalf("history = %+v, want %+v", got, want)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("unexpected historical binding")
+	}
+	requireStoreOK(t, rows.Err())
+}
+
+func TestPrivateStorePermissions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	requireStoreOK(t, os.Mkdir(dir, 0755))
+	requireStoreOK(t, os.Chmod(dir, 0755))
+	path := filepath.Join(dir, "omp-telegram.db")
+	requireStoreOK(t, os.WriteFile(path, nil, 0644))
+	s := openTestStore(t, dir)
+	requireStoreOK(t, s.Accept(1, []byte(`{"sensitive":"prompt"}`)))
+	for path, want := range map[string]os.FileMode{dir: 0755, path: 0600} {
+		info, err := os.Stat(path)
+		requireStoreOK(t, err)
+		if info.Mode().Perm() != want {
+			t.Fatalf("%s permissions = %o, want %o", path, info.Mode().Perm(), want)
+		}
+	}
+}
+
+func TestRejectDatabaseSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "target")
+	requireStoreOK(t, os.WriteFile(target, []byte("unrelated"), 0600))
+	requireStoreOK(t, os.Symlink(target, filepath.Join(dir, "omp-telegram.db")))
+	if s, err := Open(dir); err == nil {
+		s.Close()
+		t.Fatal("opened symlink as database")
+	}
+	contents, err := os.ReadFile(target)
+	requireStoreOK(t, err)
+	if string(contents) != "unrelated" {
+		t.Fatalf("database open modified symlink target: %q", contents)
+	}
+}
+
+func TestBindingReplacementRollsBackHistory(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	old := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/project", Session: "/sessions/original.jsonl", Generation: 1}
+	requireStoreOK(t, s.Save(old))
+	_, err := s.DB.Exec(`CREATE TRIGGER reject_binding BEFORE UPDATE ON bindings BEGIN SELECT RAISE(ABORT,'binding failure'); END`)
+	requireStoreOK(t, err)
+	next := old
+	next.Session, next.Generation, next.Running = "/sessions/new.jsonl", 2, true
+	if err = s.Save(next); err == nil {
+		t.Fatal("binding replacement unexpectedly succeeded")
+	}
+	got, err := s.Binding(old.Bot, old.Chat, old.Thread)
+	requireStoreOK(t, err)
+	if got != old {
+		t.Fatalf("failed save replaced binding: %+v", got)
+	}
+	var count int
+	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM history").Scan(&count))
+	if count != 0 {
+		t.Fatalf("failed save created %d historical bindings", count)
+	}
+}
+
+func TestRunningBindingsSurviveRestartAndStayScoped(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	first := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/project", Session: "/sessions/first.jsonl", Generation: 1, Running: true}
+	second := first
+	second.Thread, second.Session = 4, "/sessions/second.jsonl"
+	third := first
+	third.Chat, third.Thread, third.Session = 3, 1, "/sessions/third.jsonl"
+	closed := first
+	closed.Thread, closed.Running = 1, false
+	otherBot := first
+	otherBot.Bot = 2
+	for _, b := range []Binding{third, closed, second, otherBot, first} {
+		requireStoreOK(t, s.Save(b))
+	}
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	got, err := s.RunningBindings(first.Bot)
+	requireStoreOK(t, err)
+	want := []Binding{first, second, third}
+	if len(got) != len(want) {
+		t.Fatalf("running bindings = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("running binding %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	requireStoreOK(t, s.SetRunning(first, false))
+	requireStoreOK(t, s.Close())
+	s = openTestStore(t, dir)
+	got, err = s.RunningBindings(first.Bot)
+	requireStoreOK(t, err)
+	if len(got) != 2 || got[0] != second || got[1] != third {
+		t.Fatalf("closed binding eligible after restart: %+v", got)
+	}
+	got, err = s.RunningBindings(otherBot.Bot)
+	requireStoreOK(t, err)
+	if len(got) != 1 || got[0] != otherBot {
+		t.Fatalf("other bot changed by close: %+v", got)
+	}
+}
+
+func TestSetRunningCannotDisableReplacementGeneration(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	old := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspace", Session: "/sessions/old.jsonl", Generation: 1, Running: true}
+	requireStoreOK(t, s.Save(old))
+	next := old
+	next.Session, next.Generation = "/sessions/new.jsonl", 2
+	requireStoreOK(t, s.Save(next))
+	requireStoreOK(t, s.SetRunning(old, false))
+	got, err := s.RunningBindings(1)
+	requireStoreOK(t, err)
+	if len(got) != 1 || got[0] != next {
+		t.Fatalf("stale exit disabled replacement: %+v", got)
+	}
+	requireStoreOK(t, s.SetRunning(next, false))
+	got, err = s.RunningBindings(1)
+	requireStoreOK(t, err)
+	if len(got) != 0 {
+		t.Fatalf("current exit left running binding: %+v", got)
+	}
+	requireStoreOK(t, s.SetRunning(old, true))
+	got, err = s.RunningBindings(1)
+	requireStoreOK(t, err)
+	if len(got) != 0 {
+		t.Fatalf("stale generation revived closed replacement: %+v", got)
+	}
+	requireStoreOK(t, s.SetRunning(next, true))
+	got, err = s.RunningBindings(1)
+	requireStoreOK(t, err)
+	if len(got) != 1 || got[0] != next {
+		t.Fatalf("current generation could not resume: %+v", got)
+	}
+}
