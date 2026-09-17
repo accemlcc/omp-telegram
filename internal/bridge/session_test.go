@@ -16,16 +16,16 @@ func TestResumeNativeIDRestoresDirectoryAcrossTopics(t *testing.T) {
 	ctx, cancel := context.WithCancel(first.ctx)
 	second := &worker{b: first.b, key: target{chat: -10, thread: 22}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)}
 	t.Cleanup(func() { second.shutdown(); cancel(); second.background.Wait(); second.drainMediaResults() })
-	second.start(true, id, "")
+	second.start(true, id, "", false)
 	if second.client != nil {
 		t.Fatal("same native session opened concurrently in another topic")
 	}
 	command("/close")
-	second.start(true, id, "")
+	second.start(true, id, "", false)
 	if second.client == nil || second.binding.Session != original.Session || second.binding.Workspace != original.Workspace || second.sessionID != id {
 		t.Fatal("ID resume did not restore original native session and cwd")
 	}
-	first.start(true, id, "")
+	first.start(true, id, "", false)
 	if first.client != nil {
 		t.Fatal("native ID resume bypassed active session ownership")
 	}

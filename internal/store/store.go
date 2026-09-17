@@ -4,14 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Store struct{ DB *sql.DB }
 type Binding struct {
@@ -19,6 +21,12 @@ type Binding struct {
 	Workspace, Session string
 	Generation         int64
 	Running            bool
+}
+type StartIntent struct {
+	Bot, Chat, Thread  int64
+	Kind               string
+	Workspace, Session string
+	Generation         int64
 }
 type Input struct {
 	ID  int64
@@ -52,7 +60,7 @@ func Open(dir string) (*Store, error) {
 	if e = f.Close(); e != nil {
 		return nil, e
 	}
-	db, e := sql.Open("sqlite", path)
+	db, e := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String())
 	if e != nil {
 		return nil, e
 	}
@@ -73,7 +81,7 @@ func initialize(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version != 0 && version != schemaVersion {
+	if version < 0 || version > schemaVersion {
 		return fmt.Errorf("unsupported database schema version %d; this binary supports version %d", version, schemaVersion)
 	}
 	if version == 0 {
@@ -97,11 +105,21 @@ func initialize(db *sql.DB) error {
 		_, e = tx.Exec(`
  CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
  CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+ CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread));
  CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
  CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL);
  CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '');
  CREATE INDEX idx_inbox_state ON inbox(state,id);
  CREATE INDEX idx_outbox_state ON outbox(state,id);`)
+		if e != nil {
+			return e
+		}
+		if _, e = tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); e != nil {
+			return e
+		}
+	}
+	if version == 1 {
+		_, e = tx.Exec("CREATE TABLE startup_intents(bot INTEGER,chat INTEGER,thread INTEGER,kind TEXT NOT NULL CHECK(kind IN ('new','resume')),workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(bot,chat,thread))")
 		if e != nil {
 			return e
 		}
@@ -212,6 +230,82 @@ func (s *Store) RunningBindings(bot int64) ([]Binding, error) {
 func (s *Store) SetRunning(b Binding, running bool) error {
 	_, e := s.DB.Exec("UPDATE bindings SET running=? WHERE bot=? AND chat=? AND thread=? AND generation=?", running, b.Bot, b.Chat, b.Thread, b.Generation)
 	return e
+}
+
+func (s *Store) PrepareStart(previous Binding, intent StartIntent) error {
+	if (intent.Kind != "new" && intent.Kind != "resume") || intent.Generation != previous.Generation+1 {
+		return errors.New("invalid startup intent")
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if previous.Running {
+		result, err := tx.Exec("UPDATE bindings SET running=0 WHERE bot=? AND chat=? AND thread=? AND generation=? AND running=1", previous.Bot, previous.Chat, previous.Thread, previous.Generation)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return errors.New("startup binding changed")
+		}
+	}
+	_, err = tx.Exec("INSERT INTO startup_intents(bot,chat,thread,kind,workspace,session,generation) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET kind=excluded.kind,workspace=excluded.workspace,session=excluded.session,generation=excluded.generation", intent.Bot, intent.Chat, intent.Thread, intent.Kind, intent.Workspace, intent.Session, intent.Generation)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CommitStart(b Binding) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var generation int64
+	if err = tx.QueryRow("SELECT generation FROM startup_intents WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread).Scan(&generation); err != nil {
+		return err
+	}
+	if generation != b.Generation {
+		return errors.New("startup intent changed")
+	}
+	if _, err = tx.Exec("INSERT INTO history(bot,chat,thread,workspace,session,generation) SELECT bot,chat,thread,workspace,session,generation FROM bindings WHERE bot=? AND chat=? AND thread=?", b.Bot, b.Chat, b.Thread); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO bindings(bot,chat,thread,workspace,session,generation,running) VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot,chat,thread) DO UPDATE SET workspace=excluded.workspace,session=excluded.session,generation=excluded.generation,running=excluded.running", b.Bot, b.Chat, b.Thread, b.Workspace, b.Session, b.Generation, b.Running); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", b.Bot, b.Chat, b.Thread, b.Generation); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CancelStart(intent StartIntent) error {
+	_, err := s.DB.Exec("DELETE FROM startup_intents WHERE bot=? AND chat=? AND thread=? AND generation=?", intent.Bot, intent.Chat, intent.Thread, intent.Generation)
+	return err
+}
+
+func (s *Store) PendingStarts(bot int64) ([]StartIntent, error) {
+	rows, err := s.DB.Query("SELECT bot,chat,thread,kind,workspace,session,generation FROM startup_intents WHERE bot=? ORDER BY chat,thread", bot)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var intents []StartIntent
+	for rows.Next() {
+		var intent StartIntent
+		if err = rows.Scan(&intent.Bot, &intent.Chat, &intent.Thread, &intent.Kind, &intent.Workspace, &intent.Session, &intent.Generation); err != nil {
+			return nil, err
+		}
+		intents = append(intents, intent)
+	}
+	return intents, rows.Err()
 }
 
 func (s *Store) Enqueue(chat, thread int64, text string) error {

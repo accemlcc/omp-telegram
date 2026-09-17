@@ -44,6 +44,21 @@ func TestSchemaVersionSurvivesReopen(t *testing.T) {
 	}
 }
 
+func TestOpenEscapesQuestionMarkInDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state?one")
+	s := openTestStore(t, dir)
+	if err := s.Accept(10, []byte(`{"update_id":10}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "omp-telegram.db"))
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("database in question-mark directory was not opened: info=%v error=%v", info, err)
+	}
+}
+
 func TestUnsupportedSchemaLeavesDataUntouched(t *testing.T) {
 	for name, version := range map[string]int{"unversioned": 0, "future": schemaVersion + 1} {
 		t.Run(name, func(t *testing.T) {
@@ -66,6 +81,31 @@ func TestUnsupportedSchemaLeavesDataUntouched(t *testing.T) {
 				t.Fatalf("rejected database was modified: value=%q version=%d objects=%d", value, actual, objects)
 			}
 		})
+	}
+}
+
+func TestVersionOneMigratesStartupIntents(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "omp-telegram.db"))
+	requireStoreOK(t, err)
+	_, err = db.Exec(`CREATE TABLE meta (key TEXT PRIMARY KEY,value INTEGER NOT NULL);
+CREATE TABLE bindings(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT NOT NULL,session TEXT NOT NULL,generation INTEGER NOT NULL,running INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot,chat,thread));
+CREATE TABLE history(bot INTEGER,chat INTEGER,thread INTEGER,workspace TEXT,session TEXT,generation INTEGER);
+CREATE TABLE inbox(id INTEGER PRIMARY KEY,raw BLOB NOT NULL,state TEXT NOT NULL);
+CREATE TABLE outbox(id INTEGER PRIMARY KEY AUTOINCREMENT,chat INTEGER,thread INTEGER,text TEXT NOT NULL,state TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'text',path TEXT NOT NULL DEFAULT '',name TEXT NOT NULL DEFAULT '');
+CREATE INDEX idx_inbox_state ON inbox(state,id);
+CREATE INDEX idx_outbox_state ON outbox(state,id);
+PRAGMA user_version=1;`)
+	requireStoreOK(t, err)
+	requireStoreOK(t, db.Close())
+	s := openTestStore(t, dir)
+	var version int
+	requireStoreOK(t, s.DB.QueryRow("PRAGMA user_version").Scan(&version))
+	if version != schemaVersion {
+		t.Fatalf("migrated version = %d, want %d", version, schemaVersion)
+	}
+	if _, err := s.PendingStarts(1); err != nil {
+		t.Fatalf("startup intent migration missing table: %v", err)
 	}
 }
 
@@ -350,6 +390,36 @@ func TestBindingReplacementRollsBackHistory(t *testing.T) {
 	requireStoreOK(t, s.DB.QueryRow("SELECT COUNT(*) FROM history").Scan(&count))
 	if count != 0 {
 		t.Fatalf("failed save created %d historical bindings", count)
+	}
+}
+
+func TestStartupIntentCommitsReplacementAtomically(t *testing.T) {
+	s := openTestStore(t, t.TempDir())
+	old := Binding{Bot: 1, Chat: 2, Thread: 3, Workspace: "/workspaces/old", Session: "/sessions/old.jsonl", Generation: 1, Running: true}
+	requireStoreOK(t, s.Save(old))
+	intent := StartIntent{Bot: old.Bot, Chat: old.Chat, Thread: old.Thread, Kind: "new", Workspace: "/workspaces/new", Generation: 2}
+	requireStoreOK(t, s.PrepareStart(old, intent))
+	stored, err := s.Binding(old.Bot, old.Chat, old.Thread)
+	requireStoreOK(t, err)
+	if stored.Running {
+		t.Fatal("prepare retained replacement eligibility")
+	}
+	intents, err := s.PendingStarts(old.Bot)
+	requireStoreOK(t, err)
+	if len(intents) != 1 || intents[0] != intent {
+		t.Fatalf("prepared intents = %+v, want %+v", intents, []StartIntent{intent})
+	}
+	next := Binding{Bot: old.Bot, Chat: old.Chat, Thread: old.Thread, Workspace: intent.Workspace, Session: "/sessions/new.jsonl", Generation: intent.Generation, Running: true}
+	requireStoreOK(t, s.CommitStart(next))
+	stored, err = s.Binding(old.Bot, old.Chat, old.Thread)
+	requireStoreOK(t, err)
+	if stored != next {
+		t.Fatalf("committed binding = %+v, want %+v", stored, next)
+	}
+	intents, err = s.PendingStarts(old.Bot)
+	requireStoreOK(t, err)
+	if len(intents) != 0 {
+		t.Fatalf("committed startup intent remained: %+v", intents)
 	}
 }
 

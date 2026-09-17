@@ -68,6 +68,7 @@ type worker struct {
 	input          chan incoming
 	client         *omp.Client
 	binding        store.Binding
+	startIntent    *store.StartIntent
 	sessionID      string
 	claimedSession string
 	restoring      bool
@@ -108,6 +109,13 @@ type operationResult struct {
 	generation int64
 	err        error
 }
+type callbackResult bool
+
+const (
+	callbackDone      callbackResult = true
+	callbackUncertain callbackResult = false
+)
+
 type rpcEvent struct {
 	Type                  string                       `json:"type"`
 	ID                    string                       `json:"id"`
@@ -241,6 +249,7 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 				delete(delivered, id)
 			}
 		}
+		blocked := make(map[target]bool)
 		for _, in := range inputs {
 			if delivered[in.ID] {
 				continue
@@ -277,15 +286,19 @@ func Run(ctx context.Context, cfg config.Config, db *store.Store) error {
 				continue
 			}
 			key := target{m.Chat.ID, m.MessageThreadID}
+			if blocked[key] {
+				continue
+			}
 			w := workers[key]
 			if w == nil {
-				w = b.launchWorker(ctx, key, store.Binding{}, false)
+				w = b.launchWorker(ctx, key, store.Binding{}, false, nil)
 				workers[key] = w
 			}
 			select {
 			case w.input <- incoming{in.ID, m, u.CallbackQuery}:
 				delivered[in.ID] = true
 			default:
+				blocked[key] = true
 			}
 		}
 		select {
@@ -379,8 +392,10 @@ func (w *worker) run() {
 	w.initResumePicker()
 	defer func() { w.cancel(); w.background.Wait(); w.drainMediaResults() }()
 	defer w.shutdown()
-	if w.restoring {
-		w.start(true, w.binding.Session, w.binding.Workspace)
+	if w.startIntent != nil {
+		w.say("A requested " + w.startIntent.Kind + " session start was interrupted before omp identity was saved. The outcome is uncertain. Use /close to cancel it, then use /new or /resume explicitly.")
+	} else if w.restoring {
+		w.start(true, w.binding.Session, w.binding.Workspace, false)
 		w.restoring = false
 	}
 	tick := time.NewTicker(1500 * time.Millisecond)
@@ -391,6 +406,18 @@ func (w *worker) run() {
 		if w.client != nil {
 			events = w.client.Events()
 			done = w.client.Done()
+		}
+		if events != nil {
+			select {
+			case raw, ok := <-events:
+				if !ok {
+					w.failed()
+				} else {
+					w.event(raw)
+				}
+				continue
+			default:
+			}
 		}
 		select {
 		case <-w.ctx.Done():
@@ -412,7 +439,7 @@ func (w *worker) run() {
 				w.lastPreview = result.text
 			}
 			if w.finishing {
-				w.finish()
+				w.finishPreview()
 			}
 		case result := <-w.operations:
 			if result.generation == w.binding.Generation && w.client != nil {
@@ -447,6 +474,7 @@ func (w *worker) shutdown() {
 		if q.cancel != nil {
 			q.cancel()
 		}
+		removeIncoming(w.binding.Workspace, q.directory)
 	}
 	for id, cancel := range w.hostRequests {
 		cancel()
@@ -509,8 +537,8 @@ func (w *worker) newWorkspace(arg string) (string, error) {
 	return old.Workspace, nil
 }
 
-func (w *worker) start(resume bool, target, expectedCWD string) {
-	if w.client != nil {
+func (w *worker) start(resume bool, target, expectedCWD string, replace bool) {
+	if w.client != nil && !replace {
 		w.say("An instance is already running. Use /new for a fresh session, or /close before resuming another session.")
 		return
 	}
@@ -544,22 +572,67 @@ func (w *worker) start(resume bool, target, expectedCWD string) {
 			return
 		}
 	}
-	select {
-	case w.b.slots <- struct{}{}:
-	default:
-		w.say("The active instance limit has been reached.")
-		return
+	reuseSlot := replace && w.client != nil
+	reserved := false
+	if !reuseSlot {
+		select {
+		case w.b.slots <- struct{}{}:
+			reserved = true
+		default:
+			w.say("The active instance limit has been reached.")
+			return
+		}
 	}
 	if !resume {
 		if e = os.MkdirAll(cwd, 0700); e != nil {
-			<-w.b.slots
+			if reserved {
+				<-w.b.slots
+			}
 			w.say("Failed to create the working directory.")
 			return
 		}
 	}
+	prepared := false
+	if !w.restoring {
+		intentWorkspace := cwd
+		if intentWorkspace == "" {
+			intentWorkspace = old.Workspace
+		}
+		intent := store.StartIntent{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: intentWorkspace, Session: session, Generation: old.Generation + 1, Kind: "new"}
+		if resume {
+			intent.Kind = "resume"
+		}
+		if e = w.b.db.PrepareStart(old, intent); e != nil {
+			if reserved {
+				<-w.b.slots
+			}
+			w.say("Failed to save the startup intent.")
+			return
+		}
+		prepared = true
+		w.startIntent = &intent
+		w.binding = old
+		w.binding.Running = false
+		if replace {
+			w.clearQueue()
+			w.shutdown()
+			if reuseSlot {
+				w.b.slots <- struct{}{}
+				reserved = true
+			}
+			w.active = 0
+			w.busy = false
+			w.confirms = map[string]confirmation{}
+		}
+	}
 	c, e := omp.Start(w.ctx, omp.Config{Binary: w.b.cfg.OMP, CWD: cwd, Resume: session, Args: w.b.cfg.OMPArgs})
 	if e != nil {
-		<-w.b.slots
+		if reserved {
+			<-w.b.slots
+		}
+		if prepared && !w.cancelStart() {
+			return
+		}
 		if resume {
 			w.say("Failed to resume omp. Check the session ID, original directory, and omp configuration.")
 		} else {
@@ -605,26 +678,33 @@ func (w *worker) start(resume bool, target, expectedCWD string) {
 		w.say("Cannot register Telegram attachment delivery. The instance has been closed.")
 		return
 	}
-	w.binding = store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, Generation: old.Generation + 1, Running: true}
-	if e = w.b.db.Save(w.binding); e != nil {
+	binding := store.Binding{Bot: w.b.bot.ID, Chat: w.key.chat, Thread: w.key.thread, Workspace: info.CWD, Session: info.File, Generation: old.Generation + 1, Running: true}
+	if w.restoring {
+		e = w.b.db.Save(binding)
+	} else {
+		e = w.b.db.CommitStart(binding)
+	}
+	if e != nil {
 		w.shutdown()
 		w.say("Failed to save the session binding. The instance has been closed.")
 		return
 	}
+	w.binding = binding
+	w.startIntent = nil
 	w.preview, w.lastPreview = "", ""
 	w.previewID = 0
 	w.say("omp is ready.\nWorkspace: " + info.CWD + "\nSession: " + info.ID)
-	if w.restoring {
-		w.say("The previous session was restored after service restart. Interrupted tasks and previously queued prompts were not resubmitted.")
-	}
 }
 func (w *worker) handle(in incoming) {
 	if in.callback != nil {
 		if !w.mark(in.id, "submitted") {
 			return
 		}
-		w.callback(in.callback)
-		w.mark(in.id, "done")
+		if w.callback(in.callback) == callbackUncertain {
+			w.mark(in.id, "uncertain")
+		} else {
+			w.mark(in.id, "done")
+		}
 		return
 	}
 	text := strings.TrimSpace(in.msg.Text)
@@ -679,16 +759,16 @@ func (w *worker) handle(in incoming) {
 		if w.client != nil {
 			w.confirm(confirmation{action: "new", workspace: workspace, user: in.msg.From.ID}, "Start a new omp session in: "+workspace+"?\nExisting files and session history will be preserved.", []string{"Confirm", "Cancel"})
 		} else {
-			w.start(false, workspace, "")
+			w.start(false, workspace, "", false)
 		}
 	case "/resume":
 		if arg == "" {
 			w.requestResumeList(in.msg.From.ID)
 		} else {
-			w.start(true, arg, "")
+			w.start(true, arg, "", false)
 		}
 	case "/close":
-		if !w.persistClosed() {
+		if !w.cancelStart() || !w.persistClosed() {
 			return
 		}
 		w.clearQueue()
@@ -804,11 +884,6 @@ func (w *worker) dispatch() {
 	}
 }
 func (w *worker) finish() {
-	if w.previewBusy {
-		w.finishing = true
-		return
-	}
-	w.finishing = false
 	w.toolName = ""
 	if w.active != 0 {
 		text := w.preview
@@ -823,14 +898,22 @@ func (w *worker) finish() {
 			}
 			return
 		}
+		w.active = 0
+		w.busy = false
+		w.preview = ""
+		w.stream.Reset()
+		w.confirms = map[string]confirmation{}
 	} else if w.preview != "" {
 		w.say(w.preview)
 	}
-	w.active = 0
-	w.busy = false
-	w.preview = ""
-	w.stream.Reset()
-	w.confirms = map[string]confirmation{}
+	if w.previewBusy {
+		w.finishing = true
+		return
+	}
+	w.finishPreview()
+}
+func (w *worker) finishPreview() {
+	w.finishing = false
 	if w.previewID != 0 {
 		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
 		_ = w.b.tg.Edit(ctx, w.key.chat, w.previewID, "Preview ended. The complete result follows.", nil)
@@ -980,28 +1063,28 @@ func (w *worker) confirm(c confirmation, title string, options []string) {
 		w.say("Failed to send the confirmation. The operation was canceled.")
 	}
 }
-func (w *worker) callback(q *telegram.CallbackQuery) {
+func (w *worker) callback(q *telegram.CallbackQuery) callbackResult {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 	token, index, ok := strings.Cut(q.Data, ":")
 	c, exists := w.confirms[token]
 	if !ok || !exists || time.Now().After(c.expires) || c.generation != w.binding.Generation || c.user != q.From.ID {
 		_ = w.b.tg.AnswerCallback(ctx, q.ID, "This action has expired")
-		return
+		return callbackDone
 	}
 	n, err := strconv.Atoi(index)
 	if err != nil || n < 0 || (c.method != "select" && n > 1) || (c.method == "select" && n > len(c.options)) {
-		return
+		return callbackDone
 	}
-	delete(w.confirms, token)
 	_ = w.b.tg.AnswerCallback(ctx, q.ID, "Received")
 	if c.action == "resume" {
+		delete(w.confirms, token)
 		var messageID int64
 		if q.Message != nil {
 			messageID = q.Message.MessageID
 		}
 		w.selectResume(c, n, messageID)
-		return
+		return callbackDone
 	}
 	if c.action == "ui" {
 		frame := map[string]any{"type": "extension_ui_response", "id": c.uiID}
@@ -1012,34 +1095,36 @@ func (w *worker) callback(q *telegram.CallbackQuery) {
 		} else {
 			frame["cancelled"] = true
 		}
-		if w.client != nil {
-			_ = w.client.Send(ctx, frame)
+		if w.client == nil || w.client.Send(ctx, frame) != nil {
+			w.say("The confirmation could not be delivered to omp. Its state is uncertain and the instance has been closed.")
+			w.shutdown()
+			w.clearQueue()
+			w.active = 0
+			w.busy = false
+			return callbackUncertain
 		}
-		return
+		delete(w.confirms, token)
+		return callbackDone
 	}
+	delete(w.confirms, token)
 	if n != 0 {
-		return
+		return callbackDone
 	}
 	switch c.action {
 	case "new":
 		if !filepath.IsAbs(c.workspace) {
 			w.say("Invalid working directory. The existing instance is still running.")
-			return
+			return callbackDone
 		}
 		if err := os.MkdirAll(c.workspace, 0700); err != nil {
 			w.say("Cannot create the working directory. The existing instance is still running.")
-			return
+			return callbackDone
 		}
-		w.clearQueue()
-		w.shutdown()
-		w.active = 0
-		w.busy = false
-		w.confirms = map[string]confirmation{}
-		w.start(false, c.workspace, "")
+		w.start(false, c.workspace, "", true)
 	case "compact":
 		if w.client == nil || w.busy {
 			w.say("The instance is not idle. Compaction was canceled.")
-			return
+			return callbackDone
 		}
 		w.busy = true
 		w.compacting = true
@@ -1055,6 +1140,19 @@ func (w *worker) callback(q *telegram.CallbackQuery) {
 			}
 		}()
 	}
+	return callbackDone
+}
+
+func (w *worker) cancelStart() bool {
+	if w.startIntent == nil {
+		return true
+	}
+	if err := w.b.db.CancelStart(*w.startIntent); err != nil {
+		w.b.fail(err)
+		return false
+	}
+	w.startIntent = nil
+	return true
 }
 func (w *worker) ui(e rpcEvent) {
 	switch e.Method {

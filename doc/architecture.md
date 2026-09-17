@@ -2,7 +2,7 @@
 
 [中文版](architecture.zh.md) | [User guide](../README.md)
 
-This document describes the current implementation. Proposed startup-intent changes are explicitly separated from implemented behavior.
+This document describes the current implementation and its recovery semantics.
 
 ## Scope and ownership
 
@@ -79,7 +79,8 @@ The database is `omp-telegram.db` under `data_dir`. It uses WAL, a busy timeout,
 | Table | Key / fields | Role |
 | --- | --- | --- |
 | `meta` | `key`, integer `value` | Owning bot ID and polling offset |
-| `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running` | Current validated session binding and restoration eligibility |
+| `bindings` | PK `(bot,chat,thread)`; `workspace,session,generation,running` | Last validated session binding and restoration eligibility |
+| `startup_intents` | PK `(bot,chat,thread)`; `kind,workspace,session,generation` | Durable uncommitted `/new` or `/resume` transition |
 | `history` | `bot,chat,thread,workspace,session,generation` | Previous binding snapshots, not a session browser |
 | `inbox` | PK `id`; `raw,state` | Update deduplication and processing state |
 | `outbox` | Autoincrement `id`; `chat,thread,text,state,kind,path,name` | Ordered text/attachment delivery |
@@ -88,9 +89,9 @@ The hot-path indexes are `inbox(state,id)` and `outbox(state,id)`. There is no a
 
 ### Schema version
 
-`PRAGMA user_version` is the schema version, currently 1. An empty database creates all tables, indexes, and the version in one transaction. Reopening v1 preserves its schema and reconciles runtime states.
+`PRAGMA user_version` is the schema version, currently 2. An empty database creates all tables, indexes, and the version in one transaction. Reopening reconciles runtime states.
 
-Populated unversioned databases and unsupported versions are rejected before schema or record changes. Development-era field probing and compatibility ALTERs are intentionally absent. After release, schema changes require explicit version-to-version transactional migrations, with the version advanced only on success. An older binary must reject a newer schema. Application versions and database versions evolve independently.
+Populated unversioned databases and unsupported future versions are rejected before schema or record changes. Version 1 migrates transactionally by adding `startup_intents` and then advancing `user_version`. An older binary rejects the newer schema. Application versions and database versions evolve independently.
 
 ### Input and completion transactions
 
@@ -130,22 +131,22 @@ There is no new automatic resend for either terminal error state. Explicit Teleg
 
 ## Session lifecycle
 
-`/new` resolves a working directory and, when replacing a live instance, requires confirmation. After startup, the bridge reads native identity using `get_state` and structured `/session info` command output, validates the result, registers its host tools, then saves the binding.
+`/new` resolves a working directory and, when replacing a live instance, requires confirmation. `/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, topic, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory.
 
-`/resume` obtains the current directory's session list from a short-lived native `omp acp` process using `session/list`. The bridge does not scan session files or synthesize this list from `history`. Selection menus use random tokens with owner, topic, generation, expiry, and cancellation checks. Explicit `/resume ID` delegates native lookup to omp and may restore its original directory.
+Every user-requested start first commits a `startup_intents` record with the frozen operation, target, and next generation. In the same transaction, any prior running binding becomes ineligible for automatic restoration. Only after native identity validation and host-tool registration does a second transaction publish the binding and delete the intent. `/close` deletes a pending intent before closing the current binding.
 
 `running` is restoration eligibility, not a live PID indicator:
 
 | Event | Persisted behavior |
 | --- | --- |
-| Successful start/resume | Save native identity and `running=1` |
-| Normal daemon shutdown | Preserve restoration eligibility |
+| Successful start/resume | Publish native identity, delete intent, and set `running=1` |
+| Normal daemon shutdown | Preserve committed restoration eligibility |
 | `/stop` | Keep the instance and eligibility; clear waiting prompts |
-| `/close` | Persist `running=0`, then close the instance |
+| `/close` | Delete a pending intent, persist `running=0`, then close the instance |
 | Runtime failure closed by the worker | Clear eligibility; active task becomes uncertain |
 | Automatic restoration failure | Preserve saved identity and eligibility for manual recovery or a later service restart |
 
-Startup recovery is scoped to the current bot and allowed chats, respects worker capacity, and restores the exact saved session file and directory. Missing files/directories do not trigger a replacement conversation. A fresh omp session may report an identity before its history file exists.
+After restart, a committed running binding restores the exact saved session file and directory. An uncommitted new/resume intent does not launch another omp process: the prior start may already have created process state whose identity was never committed. The bridge creates an inactive worker, reports the uncertainty, and requires explicit `/close` followed by `/new` or `/resume`. This preserves the requested transition without replaying an uncertain operation. Missing files/directories do not trigger a replacement conversation. A fresh omp session may report an identity before its history file exists.
 
 ## Process and file safety
 
@@ -162,43 +163,16 @@ Bridge defaults are relative to the real executable directory after symlink reso
 
 The root `config.toml` is embedded once. Only an absent implicit default file selects the embedded configuration; explicit missing files and unreadable/invalid files fail. Environment expansion happens after TOML parsing and only once. `omp_args` uses quoting-aware tokenization, not shell execution. omp's own defaults remain untouched unless explicitly configured or changed by a requested RPC command.
 
-## Startup intent: design only
-
-The current sequence is:
-
-```mermaid
-flowchart TD
-    A[Authorize and validate target] --> B[Confirm replacement if needed]
-    B --> C[Close old instance and persist closed state]
-    C --> D[Spawn omp]
-    D --> E[Read and validate native identity]
-    E --> F[Save binding and increment generation]
-    F --> G[Accept ordinary prompts]
-```
-
-The close step is skipped if no instance needs replacing. A crash between closing/spawning and saving the new binding can lose the pending create/switch target. The existing startup restoration does not eliminate that window.
-
-Any future design must distinguish:
-
-| Case | Required distinction |
-| --- | --- |
-| A. Explicit new request, native identity unknown | A durable create intent, not an assumption inferred from an empty session field |
-| B. Known session cannot be restored | Preserve its identity; never fall back to new |
-| C. Identity known, native history not yet persisted | Not equivalent to A; do not fabricate history or silently replace the session |
-
-The proposed boundary is a prepare transaction recording an explicit operation, frozen target, and attempt generation before spawn, followed by a guarded publish transaction after native identity validation. Preserve the last validated identity until the transition is resolved; `/close` must cancel any pending intent. Merely making `session` nullable or moving `Save` is insufficient.
-
-**This intent model and its database fields are not implemented.** Automatic retry of an uncertain create operation is not introduced. Residual-process handling and crash-window behavior must be established before implementing it.
-
 ## Development and release
 
 ```sh
 just build
 just check
 just install
+just service
 ```
 
-`just check` runs tests, race checks, and vet. `just install` copies only the binary. `just test` is a maintainer convenience: it installs first, then runs `supervisord ctl restart omp-telegram` using an already configured service. It is not the unit-test command.
+`just test` runs unit tests without starting or restarting a service. `just check` runs unit tests, race checks, and vet. `just install` copies only the binary. `just service` installs the binary, then restarts the existing supervised daemon.
 
 Keep regression tests for observable behavior: atomic rollback, restart identity, authorization, cancellation, delivery uncertainty, and process ownership. Use isolated workspaces/databases for real omp smoke tests. Do not describe injected Telegram input or simulated callbacks as phone-originated end-to-end validation.
 

@@ -131,7 +131,7 @@ func fixtureClient(t *testing.T) *Client {
 	return client
 }
 
-func TestLatePromptFailureIsEvent(t *testing.T) {
+func TestLatePromptResponseIsDiscarded(t *testing.T) {
 	client := fixtureClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -140,12 +140,8 @@ func TestLatePromptFailureIsEvent(t *testing.T) {
 	}
 	select {
 	case data := <-client.Events():
-		var event envelope
-		if json.Unmarshal(data, &event) != nil || event.Type != "response" || event.Success == nil || *event.Success {
-			t.Fatal("late failure not exposed")
-		}
-	case <-ctx.Done():
-		t.Fatal("late failure lost")
+		t.Fatalf("late response leaked as event: %s", data)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

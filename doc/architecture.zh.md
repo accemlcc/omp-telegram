@@ -79,7 +79,8 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 | 表 | 键 / 字段 | 用途 |
 | --- | --- | --- |
 | `meta` | `key`, 整数 `value` | 所属 Bot ID 和 polling offset |
-| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running` | 当前已验证的会话绑定和恢复资格 |
+| `bindings` | 主键 `(bot,chat,thread)`; `workspace,session,generation,running` | 最后一次已验证的会话绑定和恢复资格 |
+| `startup_intents` | 主键 `(bot,chat,thread)`; `kind,workspace,session,generation` | 尚未提交的 `/new` 或 `/resume` 持久化转换 |
 | `history` | `bot,chat,thread,workspace,session,generation` | 旧绑定快照, 不是会话浏览器 |
 | `inbox` | 主键 `id`; `raw,state` | update 去重和处理状态 |
 | `outbox` | 自增 `id`; `chat,thread,text,state,kind,path,name` | 按顺序交付文字和附件 |
@@ -88,9 +89,9 @@ Client 等待 `ready` 并协商协议 v2, 串行写入 stdin, 按 request ID 关
 
 ### Schema 版本
 
-`PRAGMA user_version` 是数据库版本, 当前为 1. 空库在同一事务中创建表, 索引和版本号. 重新打开 v1 时保留结构, 整理上次运行留下的状态.
+`PRAGMA user_version` 是数据库版本, 当前为 2. 空库在同一事务中创建表, 索引和版本号. 重新打开时整理上次运行留下的状态.
 
-已有无版本库及不支持的版本在 schema 或记录修改前被拒绝. 开发阶段的字段探测和兼容性 ALTER 已明确移除. 正式发布后, 结构变更必须有显式的逐版本事务迁移, 成功后才推进版本. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
+已有无版本库及不支持的未来版本在 schema 或记录修改前被拒绝. 版本 1 通过增加 `startup_intents` 的事务迁移后才推进 `user_version`. 旧程序必须拒绝更高版本的数据库. 应用版本和数据库版本独立变化.
 
 ### 输入与完成事务
 
@@ -130,22 +131,22 @@ Telegram client 在传输边界区分错误:
 
 ## 会话生命周期
 
-`/new` 解析工作目录, 替换已有运行实例时要求确认. 启动后通过 `get_state` 和结构化 `/session info` 命令输出读取原生身份, 校验结果, 注册桥接 host tool, 再保存绑定.
+`/new` 解析工作目录, 替换已有运行实例时要求确认. `/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, topic, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
 
-`/resume` 通过短生命周期的原生 `omp acp` 进程调用 `session/list`, 获取当前目录的会话列表. 桥接不扫描 session 文件, 不从 `history` 合成列表. 菜单使用随机 token, 校验所属用户, topic, generation, 过期时间和取消状态. 显式 `/resume ID` 交给 omp 原生查找, 可以恢复该会话的原目录.
+每次用户请求启动前, 先提交包含固定操作, 目标和下一代数的 `startup_intents` 记录. 同一事务会撤销旧运行绑定的自动恢复资格. 只有在原生身份校验和 host tool 注册后, 第二个事务才发布绑定并删除意图. `/close` 会先删除待完成意图, 再关闭当前绑定.
 
 `running` 表示恢复资格, 不是实时 PID 状态:
 
 | 事件 | 持久化行为 |
 | --- | --- |
-| 成功启动/恢复 | 保存原生身份和 `running=1` |
-| daemon 正常退出 | 保留恢复资格 |
+| 成功启动/恢复 | 发布原生身份, 删除意图并设置 `running=1` |
+| daemon 正常退出 | 保留已提交的恢复资格 |
 | `/stop` | 保留实例和恢复资格, 清空等待 prompt |
-| `/close` | 先保存 `running=0`, 再关闭实例 |
+| `/close` | 删除待完成意图, 保存 `running=0`, 再关闭实例 |
 | worker 回收运行期故障实例 | 清除恢复资格, 活动任务转为不确定 |
 | 自动恢复失败 | 保留身份和恢复资格, 供手动恢复或下次服务重启使用 |
 
-启动恢复限定当前 Bot 和白名单 chat, 遵守 worker 上限, 使用保存的准确 session 文件和目录. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
+重启后, 已提交且 `running=1` 的绑定会恢复准确的 session 文件和目录. 未提交的 new/resume 意图不会再次启动 omp: 之前的启动可能已创建身份尚未提交的进程状态. 桥接会创建未激活 worker 并报告不确定性, 必须显式执行 `/close`, 再执行 `/new` 或 `/resume`. 这会保留用户请求的转换, 又不会重放不确定操作. 文件或目录缺失不会创建替代会话. omp 新会话可能先返回身份, 再持久化历史文件.
 
 ## 进程与文件安全
 
@@ -162,43 +163,16 @@ Telegram client 在传输边界区分错误:
 
 根目录 `config.toml` 只内嵌一份. 仅当隐式默认文件不存在时才使用内嵌配置, 显式缺失文件及不可读/无效文件均报错. 环境变量在 TOML 解析后只展开一次. `omp_args` 只进行支持引号的分词, 不执行 shell. 除显式配置或用户请求的 RPC 设置外, 不改变 omp 自身默认值.
 
-## 启动意图: 仅设计
-
-当前流程:
-
-```mermaid
-flowchart TD
-    A[鉴权并校验目标] --> B[需要替换时确认]
-    B --> C[关闭旧实例并保存关闭状态]
-    C --> D[启动 omp]
-    D --> E[读取并校验原生身份]
-    E --> F[保存绑定并增加 generation]
-    F --> G[允许普通 prompt]
-```
-
-没有待替换实例时跳过关闭步骤. 在关闭/启动与保存新绑定之间崩溃, 可能丢失本次创建或切换目标. 已有启动恢复逻辑没有消除这个窗口.
-
-后续设计必须区分:
-
-| 情形 | 必须区分的信息 |
-| --- | --- |
-| A. 明确请求 new, 原生身份未知 | 持久化创建意图, 不能从空 session 字段猜测 |
-| B. 已知 session 恢复失败 | 保留身份, 绝不降级成 new |
-| C. 身份已知, 原生历史尚未持久化 | 不等于 A, 不制造历史文件或静默替换会话 |
-
-建议边界是: spawn 前用准备事务记录明确操作, 冻结目标和尝试代数; 校验原生身份后, 再用带代数条件的发布事务完成绑定. 转换完成前保留最后有效身份, `/close` 必须取消待完成意图. 仅把 `session` 改成可空, 或移动 `Save` 的位置, 都不足以表达这些状态.
-
-**这个意图模型及其数据库字段尚未实现.** 本轮不引入不确定创建操作的自动重试. 实现前必须确定残留进程处理及崩溃窗口行为.
-
 ## 开发与发布
 
 ```sh
 just build
 just check
 just install
+just service
 ```
 
-`just check` 执行测试, race 和 vet. `just install` 只复制二进制. `just test` 是维护者捷径: 先安装, 再通过已有服务配置执行 `supervisord ctl restart omp-telegram`, 不是单元测试命令.
+`just test` 只运行单元测试, 不启动或重启服务. `just check` 执行单元测试, race 和 vet. `just install` 只复制二进制. `just service` 安装二进制后重启已有的 supervisor 服务.
 
 保留能防止可观察回归的测试: 原子回滚, 重启身份保持, 鉴权, 取消, 交付不确定性和进程所有权. 真实 omp smoke 使用隔离的工作目录及数据库. 注入的 Telegram 输入或模拟 callback 不能当作手机端完整验收.
 

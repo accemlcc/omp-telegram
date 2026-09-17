@@ -2,7 +2,9 @@ package bridge
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -11,10 +13,10 @@ import (
 	"omp-telegram/internal/telegram"
 )
 
-func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Binding, restoring bool) *worker {
+func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Binding, restoring bool, intent *store.StartIntent) *worker {
 	ctx, cancel := context.WithCancel(ctx)
 	w := &worker{
-		b: b, key: key, binding: binding, restoring: restoring,
+		b: b, key: key, binding: binding, restoring: restoring, startIntent: intent,
 		input:    make(chan incoming, b.cfg.QueueCapacity+16),
 		confirms: map[string]confirmation{}, previewResult: make(chan previewResult, 1),
 		operations: make(chan operationResult, 1), ctx: ctx, cancel: cancel,
@@ -28,6 +30,10 @@ func (b *Bridge) launchWorker(ctx context.Context, key target, binding store.Bin
 }
 
 func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker) error {
+	intents, err := b.db.PendingStarts(b.bot.ID)
+	if err != nil {
+		return err
+	}
 	bindings, err := b.db.RunningBindings(b.bot.ID)
 	if err != nil {
 		return err
@@ -57,7 +63,27 @@ func (b *Bridge) restoreWorkers(ctx context.Context, workers map[target]*worker)
 			continue
 		}
 		key := target{binding.Chat, binding.Thread}
-		workers[key] = b.launchWorker(ctx, key, binding, true)
+		workers[key] = b.launchWorker(ctx, key, binding, true, nil)
+	}
+	for i := range intents {
+		intent := &intents[i]
+		if ctx.Err() != nil {
+			break
+		}
+		if intent.Thread == 0 || !slices.Contains(b.cfg.AllowedChats, intent.Chat) {
+			continue
+		}
+		key := target{intent.Chat, intent.Thread}
+		if workers[key] != nil {
+			continue
+		}
+		binding, err := b.db.Binding(intent.Bot, intent.Chat, intent.Thread)
+		if errors.Is(err, sql.ErrNoRows) {
+			binding = store.Binding{Bot: intent.Bot, Chat: intent.Chat, Thread: intent.Thread}
+		} else if err != nil {
+			return err
+		}
+		workers[key] = b.launchWorker(ctx, key, binding, false, intent)
 	}
 	return nil
 }

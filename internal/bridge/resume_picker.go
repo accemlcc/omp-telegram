@@ -242,11 +242,7 @@ func (w *worker) selectResume(c confirmation, index int, messageID int64) {
 			w.say("omp returned an unsupported session ID.")
 			return
 		}
-		w.clearQueue()
-		w.shutdown()
-		w.active = 0
-		w.busy = false
-		w.start(true, selected.ID, c.workspace)
+		w.start(true, selected.ID, c.workspace, true)
 		return
 	}
 	if c.page > 0 {

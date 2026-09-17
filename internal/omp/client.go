@@ -417,6 +417,9 @@ func (c *Client) readLoop() {
 				c.fail(errors.New("omp: uncorrelated RPC response"))
 				return
 			}
+			// A response with an ID is never an asynchronous event. If its caller
+			// already left, it cannot safely affect a later bridge operation.
+			continue
 		}
 		if env.Type == "command_output" && c.captureMetadata(frame) {
 			continue

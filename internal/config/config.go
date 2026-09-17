@@ -105,8 +105,13 @@ func load(path, baseDir string) (Config, error) {
 	if c.Token == "" || c.OMP == "" || c.DataDir == "" {
 		return c, errors.New("token, omp and data_dir must be nonempty")
 	}
-	if _, err = exec.LookPath(c.OMP); err != nil {
+	ompPath, err := exec.LookPath(c.OMP)
+	if err != nil {
 		return c, errors.New("omp executable not found")
+	}
+	c.OMP, err = filepath.Abs(ompPath)
+	if err != nil {
+		return c, errors.New("cannot resolve omp executable path")
 	}
 	if c.AllowedUsers, err = integers(raw.AllowedUsers, "allowed_users"); err != nil {
 		return c, err

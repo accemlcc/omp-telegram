@@ -389,24 +389,46 @@ func TestSplitPreservesUnicodeAndLength(t *testing.T) {
 		}
 	}
 }
-func TestFinalWaitsForInFlightPreview(t *testing.T) {
+func TestFinalPersistsWhilePreviewIsInFlight(t *testing.T) {
 	db, e := store.Open(t.TempDir())
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer db.Close()
+	if e = db.Accept(10, []byte(`{"update_id":10}`)); e != nil {
+		t.Fatal(e)
+	}
+	if e = db.Mark(10, "submitted"); e != nil {
+		t.Fatal(e)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, previewBusy: true, preview: "answer", busy: true, confirms: map[string]confirmation{}}
-	w.finish()
-	if _, e = db.NextOutput(); e == nil {
-		t.Fatal("final overtook preview")
-	}
-	w.previewBusy = false
+	w := &worker{b: &Bridge{db: db}, ctx: ctx, cancel: cancel, active: 10, previewBusy: true, preview: "answer", busy: true, confirms: map[string]confirmation{}}
 	w.finish()
 	o, e := db.NextOutput()
 	if e != nil || o.Text != "answer" {
-		t.Fatalf("final lost: %v", e)
+		t.Fatalf("final was not persisted before preview completion: %v", e)
+	}
+	if !w.finishing {
+		t.Fatal("preview finalization was not deferred")
+	}
+}
+
+func TestFailedUICallbackMarksUpdateUncertain(t *testing.T) {
+	w, _, command := setupWorkspaceWorker(t)
+	command("/new " + t.TempDir())
+	w.confirms["ui"] = confirmation{action: "ui", uiID: "ui-request", method: "confirm", generation: w.binding.Generation, user: 7, expires: time.Now().Add(time.Minute)}
+	_ = w.client.Close()
+	if err := w.b.db.Accept(99, []byte(`{"update_id":99}`)); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(incoming{id: 99, callback: &telegram.CallbackQuery{ID: "callback", From: telegram.User{ID: 7}, Data: "ui:0"}})
+	var state string
+	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=99").Scan(&state); err != nil || state != "uncertain" {
+		t.Fatalf("failed UI callback state = %q, error %v", state, err)
+	}
+	if w.client != nil {
+		t.Fatal("failed UI callback left omp running")
 	}
 }
 

@@ -71,6 +71,29 @@ func TestResolveWorkspace(t *testing.T) {
 	}
 }
 
+func TestResolveWorkspaceTraversesParentAfterSymlinkResolution(t *testing.T) {
+	base := t.TempDir()
+	local := filepath.Join(base, "local")
+	remote := filepath.Join(base, "remote")
+	if err := os.MkdirAll(filepath.Join(remote, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(remote, "project"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(local, "project"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(remote, "child"), filepath.Join(local, "link")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveWorkspace(base, local+string(filepath.Separator)+"link"+string(filepath.Separator)+".."+string(filepath.Separator)+"project")
+	want := filepath.Join(remote, "project")
+	if err != nil || got != want {
+		t.Fatalf("workspace = %q, error %v; want %q", got, err, want)
+	}
+}
+
 func TestResolveWorkspaceRejectsInvalidPaths(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "workspaces")

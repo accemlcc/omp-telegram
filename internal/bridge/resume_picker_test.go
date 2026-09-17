@@ -343,7 +343,7 @@ func TestResumePickerRefusesAnotherTopicsActiveSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(w.ctx)
 	other := &worker{b: w.b, key: target{chat: -10, thread: 22}, ctx: ctx, cancel: cancel, confirms: make(map[string]confirmation)}
 	t.Cleanup(func() { other.shutdown(); cancel(); other.background.Wait() })
-	other.start(false, before.Workspace, "")
+	other.start(false, before.Workspace, "", false)
 	if other.client == nil {
 		t.Fatal("other topic did not start a native session")
 	}

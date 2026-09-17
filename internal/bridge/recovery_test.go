@@ -186,6 +186,34 @@ func TestDaemonRecoveryPreservesLiveSessionsWithoutReplayingTasks(t *testing.T) 
 	}
 }
 
+func TestDaemonRecoveryRetainsUncommittedStartupIntent(t *testing.T) {
+	d := newRecoveryDaemon(t, 1)
+	d.command(11, "/help")
+	d.stop()
+	db, err := store.Open(d.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.StartIntent{Bot: 99, Chat: -10, Thread: 11, Kind: "new", Workspace: t.TempDir(), Generation: 1}
+	if err = db.PrepareStart(store.Binding{Bot: 99, Chat: -10, Thread: 11}, intent); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d.start()
+	waitFor(t, func() bool { return d.fake.has(11, "start was interrupted") })
+	intents, err := d.db.PendingStarts(99)
+	if err != nil || len(intents) != 1 || intents[0] != intent {
+		t.Fatalf("recovered startup intents = %+v, error %v", intents, err)
+	}
+	d.command(11, "/close")
+	intents, err = d.db.PendingStarts(99)
+	if err != nil || len(intents) != 0 {
+		t.Fatalf("close did not cancel startup intent: %+v, error %v", intents, err)
+	}
+}
+
 func TestDaemonRecoverySkipsRemovedChatAuthorization(t *testing.T) {
 	d := newRecoveryDaemon(t, 1)
 	d.command(11, "/new "+t.TempDir())

@@ -54,6 +54,27 @@ func TestTOMLAuthorization(t *testing.T) {
 	}
 }
 
+func TestRelativeOMPPathIsMadeAbsoluteAfterValidation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "omp"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	path, source := configFixture(t)
+	source = strings.Replace(source, `omp = "$BRIDGE_TEST_OMP"`, `omp = "./bin/omp"`, 1)
+	c, err := loadSource(t, path, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "bin", "omp")
+	if c.OMP != want {
+		t.Fatalf("omp path = %q, want validated executable %q", c.OMP, want)
+	}
+}
+
 func TestOMPArgsRejectInvalidLaunchOverrides(t *testing.T) {
 	path, source := configFixture(t)
 	t.Setenv("OMP_TELEGRAM_TEST_MISSING_ARG", "")

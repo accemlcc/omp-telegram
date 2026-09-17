@@ -85,6 +85,13 @@ func TestParentDeathSignalsDirectChild(t *testing.T) {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
+	fd, err := unix.PidfdOpen(os.Getpid(), 0)
+	if err != nil {
+		t.Skipf("pidfd cleanup is unavailable: %v", err)
+	}
+	if err = unix.Close(fd); err != nil {
+		t.Fatal(err)
+	}
 	daemon := exec.Command(os.Args[0])
 	daemon.Env = append(os.Environ(), "OMP_DEATH_FIXTURE=daemon")
 	if err := daemon.Start(); err != nil {
