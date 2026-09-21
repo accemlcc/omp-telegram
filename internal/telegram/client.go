@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -302,7 +303,8 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 
 func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, options SendOptions) (Message, error) {
 	return sendWithReplyFallback(c.logger, chatID, threadID, options, func(options SendOptions) (Message, error) {
-		fields := map[string]any{"chat_id": chatID, "text": text}
+		fields := map[string]any{"chat_id": chatID}
+		applyHTML(fields, text)
 		if threadID != 0 {
 			fields["message_thread_id"] = threadID
 		}
@@ -314,8 +316,46 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 		}
 		var message Message
 		err := c.call(ctx, "sendMessage", fields, &message, false)
+		if parseEntitiesError(err) {
+			applyPlain(fields, text)
+			err = c.call(ctx, "sendMessage", fields, &message, false)
+		}
 		return message, err
 	})
+}
+
+// applyHTML renders markdown as Telegram HTML. Conversions that would exceed
+// the message length limit after escaping fall back to plain text instead of
+// risking a rejected send.
+func applyHTML(fields map[string]any, text string) {
+	html := ConvertMarkdown(text)
+	if utf16Len(html) > MaxMessageUTF16 {
+		applyPlain(fields, text)
+		return
+	}
+	fields["text"] = html
+	fields["parse_mode"] = "HTML"
+}
+
+func applyPlain(fields map[string]any, text string) {
+	fields["text"] = text
+	delete(fields, "parse_mode")
+}
+
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// parseEntitiesError reports Telegram's rejection of malformed entity markup.
+// Such messages are retried as plain text, so a conversion quirk never
+// swallows the reply.
+func parseEntitiesError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusBadRequest {
+		return false
+	}
+	desc := strings.ToLower(apiErr.Description)
+	return strings.Contains(desc, "can't parse entities") || strings.Contains(desc, "unexpected end of") || strings.Contains(desc, "unsupported start tag")
 }
 
 func sendWithReplyFallback(logger *slog.Logger, chatID, threadID int64, options SendOptions, send func(SendOptions) (Message, error)) (Message, error) {
@@ -334,11 +374,16 @@ func replyRejected(err error) bool {
 }
 
 func (c *Client) Edit(ctx context.Context, chatID, messageID int64, text string, keyboard *Keyboard) error {
-	fields := map[string]any{"chat_id": chatID, "message_id": messageID, "text": text}
+	fields := map[string]any{"chat_id": chatID, "message_id": messageID}
+	applyHTML(fields, text)
 	if keyboard != nil {
 		fields["reply_markup"] = keyboard
 	}
 	err := c.call(ctx, "editMessageText", fields, nil, false)
+	if parseEntitiesError(err) {
+		applyPlain(fields, text)
+		err = c.call(ctx, "editMessageText", fields, nil, false)
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.Code == 400 && strings.Contains(strings.ToLower(apiErr.Description), "message is not modified") {
 		return nil

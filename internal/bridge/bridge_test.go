@@ -1400,7 +1400,7 @@ func TestFinalReplyWriteFailureDoesNotCompleteInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.active, w.busy = 10, true
-	w.preview = strings.Repeat("x", 3800) + "second"
+	w.preview = strings.Repeat("x", telegram.MaxMessageUTF16) + "\n\nsecond"
 	w.finish()
 	var state string
 	if err := w.b.db.DB.QueryRow("SELECT state FROM inbox WHERE id=10").Scan(&state); err != nil {

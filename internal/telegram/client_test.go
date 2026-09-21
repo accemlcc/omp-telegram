@@ -199,15 +199,15 @@ func TestRateLimitedSendRetriesAndPreservesPlainText(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
 			t.Error(err)
 		}
-		if _, exists := fields["parse_mode"]; exists {
-			t.Error("plain text must not enable formatting")
+		if string(fields["parse_mode"]) != `"HTML"` {
+			t.Errorf("parse_mode = %s, want HTML", fields["parse_mode"])
 		}
 		var text string
 		if err := json.Unmarshal(fields["text"], &text); err != nil {
 			t.Error(err)
 		}
-		if text != "<b>literal</b> _literal_" {
-			t.Errorf("text changed: %q", text)
+		if text != "&lt;b&gt;literal&lt;/b&gt; <i>literal</i>" {
+			t.Errorf("text not converted: %q", text)
 		}
 		if string(fields["reply_to_message_id"]) != "42" {
 			t.Errorf("reply target = %s, want 42", fields["reply_to_message_id"])

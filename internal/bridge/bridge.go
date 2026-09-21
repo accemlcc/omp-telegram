@@ -734,7 +734,7 @@ func (b *Bridge) fail(err error) {
 	}
 }
 func (w *worker) say(s string) {
-	for _, part := range split(s, 3800) {
+	for _, part := range telegram.SplitForTelegram(s, telegram.MaxMessageUTF16) {
 		if e := w.b.db.Enqueue(w.key.chat, w.key.thread, part); e != nil {
 			w.b.storeLog.Error("outbox write failed", "event", "outbox_write_failed")
 			w.b.fail(e)
@@ -1834,7 +1834,7 @@ func (w *worker) finish() {
 	if w.active != 0 {
 		taskID := w.active
 		text := w.preview
-		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800)); err != nil {
+		if err := w.b.db.CompleteInboxWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16)); err != nil {
 			if w.ctx.Err() == nil {
 				w.b.storeLog.Error("final result commit failed", "event", "final_commit_failed")
 				w.b.fail(err)
@@ -1887,9 +1887,9 @@ func (w *worker) finishIncomplete(state, notice string) bool {
 	var err error
 	switch state {
 	case "uncertain":
-		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800))
+		err = w.b.db.CompleteInboxUncertainWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16))
 	case "cancelled":
-		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, split(text, 3800))
+		err = w.b.db.CompleteInboxCancelledWithReplies(w.ctx, taskID, w.key.chat, w.key.thread, telegram.SplitForTelegram(text, telegram.MaxMessageUTF16))
 	default:
 		panic("invalid terminal state")
 	}
@@ -2447,7 +2447,7 @@ func (w *worker) flushPreview() {
 	if w.finishing || snapshot == "" || w.previewBusy || snapshot == w.lastPreview {
 		return
 	}
-	text := snapshot
+	text := telegram.ClipConvertible(snapshot, telegram.MaxMessageUTF16)
 	id := w.previewID
 	creating := id == 0
 	gen := w.binding.Generation
