@@ -181,6 +181,7 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/export html` | 打开原生 OMP HTML 导出的 picker. bridge 会先把选中的 main session JSONL snapshot 到私有 spool, 再从这个稳定 snapshot 调用原生 exporter; 不包含 companion 或 subagent transcript. 结果文件名为 `omp-session-<short-id>.html`; exporter 超时为 30 秒, 输出增长受 50 MB document 限制. |
 | `/export <session ID>` | 不打开 picker, 直接导出指定 session 的原始 OMP main session `.jsonl`. 使用 `/export html <session ID>` 显式选择 HTML. |
 | `/status` | 查看 workspace, session, model, thinking, fast, context, 活动状态, 队列和速度. |
+| `/doctor` | 异步运行安全的 bridge 诊断, 不启动或修改 OMP session. |
 | `/name <名称>` | 命名当前 OMP session. 不修改 Telegram topic 名称. |
 | `/model` | 用按钮选择 OMP 配置的 model role. |
 | `/model provider/model` | 空闲时切换到指定 model. |
@@ -192,6 +193,8 @@ export OMP_TELEGRAM_PROGRESS_MODE=summary
 | `/help` | 查看帮助. |
 
 普通文字, 附件和 `/review` 都按对话排队并串行执行. 任务运行期间发送的消息会等待当前任务结束, 不会打断活动任务. 不同对话可以并行工作, 受 worker 配置上限影响.
+
+`/doctor` 检查运行时配置, Telegram `getMe`, SQLite 健康状态, data directory 写入能力, 配置的 OMP binary, 当前 workspace 和保存的 session, runtime 状态, 不确定的 inbox/outbox 记录以及磁盘剩余空间. 只返回固定的安全摘要, 不包含 token, header, prompt, 原始 RPC state 或完整本地路径. 检查期间如果 conversation state 发生变化, 结果会丢弃.
 
 以上命令都可用于普通私聊和 topic. bot 菜单, 按钮和服务提示使用英语; 可以用任意语言提问, bridge 不翻译模型回复.
 
@@ -370,8 +373,7 @@ just deploy
 
 ## 路线图
 
-计划功能:
-- `/doctor` 诊断
+目前没有列出的 bridge-side 计划功能.
 
 ### 等待上游 OMP 支持
 

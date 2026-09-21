@@ -58,6 +58,60 @@ type CleanupResult struct {
 	Inbox, Outbox   int64
 	AttachmentPaths []string
 }
+type UncertainCounts struct {
+	Inbox  int
+	Outbox int
+}
+
+func (s *Store) QuickCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rows, err := s.DB.QueryContext(ctx, "PRAGMA quick_check")
+	if err != nil {
+		return quickCheckError(err)
+	}
+	defer rows.Close()
+	var result string
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return quickCheckError(err)
+		}
+		return errors.New("sqlite quick check unavailable")
+	}
+	if err := rows.Scan(&result); err != nil {
+		return quickCheckError(err)
+	}
+	if result != "ok" {
+		return errors.New("sqlite quick check failed")
+	}
+	if rows.Next() {
+		return errors.New("sqlite quick check unavailable")
+	}
+	if err := rows.Err(); err != nil {
+		return quickCheckError(err)
+	}
+	return nil
+}
+
+func quickCheckError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errors.New("sqlite quick check unavailable")
+}
+
+func (s *Store) UncertainCounts(ctx context.Context) (UncertainCounts, error) {
+	var counts UncertainCounts
+	if err := ctx.Err(); err != nil {
+		return counts, err
+	}
+	err := s.DB.QueryRowContext(ctx, `
+SELECT
+ (SELECT COUNT(*) FROM inbox WHERE state='uncertain'),
+ (SELECT COUNT(*) FROM outbox WHERE state='uncertain')`).Scan(&counts.Inbox, &counts.Outbox)
+	return counts, err
+}
 
 func Open(dir string) (*Store, error) {
 	if e := os.MkdirAll(dir, 0700); e != nil {
@@ -85,6 +139,7 @@ func Open(dir string) (*Store, error) {
 	if e != nil {
 		return nil, e
 	}
+	// Keep one connection for a simple, ordered SQLite lifecycle. Context-aware diagnostic queries may still cause a bounded stall here; a second connection would not remove SQLite file-lock contention without measurements.
 	db.SetMaxOpenConns(1)
 	_, e = db.Exec(`PRAGMA busy_timeout=5000;`)
 	if e == nil {

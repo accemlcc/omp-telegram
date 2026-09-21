@@ -183,8 +183,12 @@ type worker struct {
 	bindingNameResults    chan bindingNamesResult
 	bindingNameCancel     context.CancelFunc
 	bindingNameRequest    uint64
-	ctx                   context.Context
-	cancel                context.CancelFunc
+	doctorResults         chan doctorResult
+	doctorCancel          context.CancelFunc
+	doctorRequest         uint64
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type terminalAssistant struct {
@@ -288,6 +292,7 @@ var botCommands = []telegram.BotCommand{
 	{Command: "export", Description: "Export an omp session: /export [html] [session-id]"},
 	{Command: "bindings", Description: "List saved conversation/session bindings"},
 	{Command: "status", Description: "Show session, model, context, speed and queue"},
+	{Command: "doctor", Description: "Run safe diagnostics"},
 	{Command: "name", Description: "Name the omp session: /name <title>"},
 	{Command: "model", Description: "Choose a cycle role or /model provider/model"},
 	{Command: "thinking", Description: "Choose the thinking level for this session"},
@@ -983,6 +988,8 @@ func (w *worker) run() {
 			w.exportFinished(result)
 		case result := <-w.bindingNameResults:
 			w.bindingNamesLoaded(result)
+		case result := <-w.doctorResults:
+			w.doctorFinished(result)
 		case result := <-w.idleProbe.results:
 			w.idleProbeFinished(result, time.Now())
 		case <-tick.C:
@@ -1002,6 +1009,11 @@ func (w *worker) teardownWorker(releaseSlot bool) {
 	w.resetIdleProbe()
 	w.cancelResumeList()
 	w.cancelBindingNameLookup()
+	if w.doctorCancel != nil {
+		w.doctorCancel()
+		w.doctorCancel = nil
+	}
+
 	w.clearQueue()
 	w.clearAlbums()
 	for id, cancel := range w.hostRequests {
@@ -1540,6 +1552,12 @@ func (w *worker) handle(in incoming) {
 		w.showQueue(in.msg.From.ID)
 	case "/status":
 		w.status()
+	case "/doctor":
+		if arg != "" {
+			w.say("Usage: /doctor")
+			return
+		}
+		w.runDoctor()
 	case "/name":
 		if arg == "" {
 			w.say("Usage: /name <session title>")

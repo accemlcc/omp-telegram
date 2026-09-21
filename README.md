@@ -181,6 +181,7 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/export html` | Open the export picker for native OMP HTML rendering. The bridge first snapshots only the selected main-session JSONL into its private spool, then invokes the native exporter from that stable snapshot; companion or subagent transcripts are not included. The result is stored as `omp-session-<short-id>.html`; exporter timeout is 30 seconds and output growth is bounded by the 50 MB document limit. |
 | `/export <session ID>` | Export the specified session as the original OMP main-session `.jsonl` without opening a picker. Use `/export html <session ID>` to choose HTML explicitly. |
 | `/status` | Show workspace, session, model, thinking, fast mode, context, activity, queue, and speed. |
+| `/doctor` | Run safe, asynchronous bridge diagnostics without starting or changing the OMP session. |
 | `/name <title>` | Name the current OMP session. It does not rename the Telegram topic. |
 | `/model` | Choose a configured OMP model role with buttons. |
 | `/model provider/model` | Switch to a specific model while idle. |
@@ -192,6 +193,8 @@ A named workspace is created when it does not exist. Existing files are not copi
 | `/help` | Show help. |
 
 Ordinary text, attachments, and `/review` are queued per conversation and run sequentially. A message sent while another task is running waits in that conversation; it does not interrupt the active task. Different conversations can run concurrently up to the configured worker capacity.
+
+`/doctor` checks runtime configuration, Telegram `getMe`, SQLite health, data-directory write access, the configured OMP binary, the current workspace and saved session, runtime state, uncertain inbox/outbox records, and free disk space. It returns fixed safe summaries only; it never includes tokens, headers, prompts, raw RPC state, or full local paths. If conversation state changes while checks run, the result is discarded.
 
 All commands work in ordinary private chats and topics. Bot menus, buttons, and service messages are in English; prompts may use any language, and model replies are not translated by the bridge.
 
@@ -372,9 +375,7 @@ just deploy
 
 ## Roadmap
 
-Planned features:
-
-- `/doctor` diagnostics
+No bridge-side feature is currently listed here.
 
 ### Waiting for upstream OMP support
 

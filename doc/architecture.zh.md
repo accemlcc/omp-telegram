@@ -304,6 +304,9 @@ Outbox 永远不指向原生 session 文件. Confirmed delivery 只删除 privat
 
 `/status` 仅在已连接时解码 `get_state` 的安全白名单字段. 当前用户 home 下的目录缩写为 `~`, 会话标题同时保留短原生 ID. Thinking 表示实际生效等级, 不代表是否配置 auto. Fast 显示实际启用状态, 与设置不同时单独注明设置值. Context 按 OMP 返回的 `contextUsage.percent` 百分数直接显示, 仅在未返回该值时用 token 用量/窗口推算; 速度使用原生 `tokensPerSecond`. 缺失指标显示 `n/a`, 与零值区分. `Queued` 仅统计 bridge 延后 prompt. 已释放运行期只显示保留的目录/session、`OMP: released`、不可用的 model/context 和队列状态, 不声称实时原生指标. 不渲染原始模型配置, header, system prompt 或原生队列数量.
 
+`/doctor` 是异步的 bridge control-plane 检查. 它不调用 `ensureRuntime`, 不启动或替换 OMP 进程, 不进入 prompt queue, 也不修改 binding. 它检查配置, Telegram `getMe`, SQLite `quick_check`, data directory 的写入/删除能力, `omp --version`, 已提交的 workspace 和 session 文件, runtime 状态, 不确定的 inbox/outbox 数量以及磁盘剩余空间. 报告只使用固定的安全摘要, 不包含 token, header, prompt, 原始 RPC state 或完整本地路径. 如果 conversation 在检查期间变化, binding 和 runtime snapshot fence 会丢弃结果; 检查进行时的第二次请求会被拒绝.
+ native history file 尚未持久化的 connected 或 starting binding 报告为 `WARN`; 缺少文件的 released running binding 报告为 `FAIL`, closed binding 缺少文件则报告为 `WARN`.
+
 `/name <名称>` 对运行中的实例调用原生 `set_session_name`. 它走控制命令路径, 不排在 prompt 后面, 不打断当前任务. 不改变 session 身份或工作目录, 不重命名 Telegram topic. 名称持久化由 OMP 管理, 包括尚未写入历史的新会话处理; bridge 不在 SQLite 另存标题副本. `/status` 从原生状态读取名称.
 
 `/handoff [补充要求]` 直接调用原生 `handoff`, 可携带 `customInstructions`; 摘要生成和上下文维护仍由 OMP 负责. 要求实例空闲且 bridge 队列为空, 复用现有异步维护结果通道, 按 generation 隔离旧结果. bridge 不创建替代 session, 不自行生成交接文档, 不重放失败或结果不确定的操作. 等待结果时仍可处理本地 `/help` 和 `/close`. 其他 RPC 命令遵循 OMP 自身串行规则, 不承诺 `/stop` 能立即中断 handoff.
