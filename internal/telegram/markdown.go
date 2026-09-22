@@ -422,15 +422,65 @@ func wordByteAt(s string, i int) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= 0x80
 }
 
+// stripInlineMarks removes inline markup from table cells: links keep their
+// label (every label, matched one by one), emphasis and code markers vanish.
 func stripInlineMarks(s string) string {
-	if m := linkRe.FindStringSubmatch(s); m != nil {
-		s = linkRe.ReplaceAllString(s, m[1])
-	}
+	s = linkRe.ReplaceAllStringFunc(s, func(m string) string {
+		return linkRe.FindStringSubmatch(m)[1]
+	})
 	return strings.NewReplacer("**", "", "__", "", "~~", "", "`", "").Replace(s)
 }
 
 func escapeHTML(s string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// renderedUTF16Len counts the UTF-16 units Telegram sees in HTML produced by
+// ConvertMarkdown: Telegram applies the message limit to the text after
+// parsing entities, so generated tags consume nothing and each escape counts
+// as the single character it renders to. The scanner relies on
+// ConvertMarkdown's invariant that escaped text never contains a raw '<':
+// every '<' opens injected markup that ends at the next '>'.
+func renderedUTF16Len(html string) int {
+	n := 0
+	for i := 0; i < len(html); {
+		switch html[i] {
+		case '<':
+			if end := strings.IndexByte(html[i:], '>'); end >= 0 {
+				i += end + 1
+				continue
+			}
+			n++
+			i++
+		case '&':
+			n++
+			switch {
+			case strings.HasPrefix(html[i:], "&amp;"):
+				i += 5
+			case strings.HasPrefix(html[i:], "&lt;"), strings.HasPrefix(html[i:], "&gt;"):
+				i += 4
+			case strings.HasPrefix(html[i:], "&quot;"):
+				i += 6
+			default:
+				i++
+			}
+		default:
+			r, size := utf8.DecodeRuneInString(html[i:])
+			units := utf16.RuneLen(r)
+			if units < 0 {
+				units = 1
+			}
+			n += units
+			i += size
+		}
+	}
+	return n
+}
+
+// convertLen is the length model for every split and clip decision: the
+// UTF-16 length of the text Telegram renders, not of the generated markup.
+func convertLen(md string) int {
+	return renderedUTF16Len(ConvertMarkdown(md))
 }
 
 // MaxMessageUTF16 is Telegram per-message text limit in UTF-16 code units.
@@ -464,18 +514,18 @@ func compactTable(rows [][]string, header []string, columns int) string {
 			if c < len(row) {
 				value = row[c]
 			}
-			cells = append(cells, labels[c]+": "+escapeHTML(value))
+			cells = append(cells, escapeHTML(labels[c])+": "+escapeHTML(value))
 		}
 		lines = append(lines, strings.Join(cells, " · "))
 	}
 	return strings.Join(lines, "\n")
 }
 
-// SplitForTelegram splits markdown into parts whose HTML conversion each fits
+// SplitForTelegram splits markdown into parts whose rendered text each fits
 // within limit UTF-16 units. Blocks stay whole: paragraphs, lists, tables and
 // code fences are never cut apart, and an oversized table repeats its header
 // and delimiter rows in every part. Only a single line with no break point is
-// hard-split, so a reply never degrades to raw markdown just because escaping
+// hard-split, so a reply never degrades to raw markdown just because markup
 // pushed it past the message cap.
 func SplitForTelegram(md string, limit int) []string {
 	if strings.TrimSpace(md) == "" {
@@ -493,7 +543,7 @@ func SplitForTelegram(md string, limit int) []string {
 				continue
 			}
 			candidate := current + "\n\n" + piece
-			if utf16Len(ConvertMarkdown(candidate)) <= limit {
+			if convertLen(candidate) <= limit {
 				current = candidate
 				continue
 			}
@@ -551,7 +601,7 @@ func markdownBlocks(md string) []string {
 
 // oversizeBlock breaks one block that cannot fit into limit units.
 func oversizeBlock(block string, limit int) []string {
-	if utf16Len(ConvertMarkdown(block)) <= limit {
+	if convertLen(block) <= limit {
 		return []string{block}
 	}
 	lines := strings.Split(block, "\n")
@@ -574,7 +624,7 @@ func splitTableBlock(lines []string, limit int) []string {
 	var chunk []string
 	for _, row := range fitRows(lines[2:], limit) {
 		candidate := append(append([]string{}, chunk...), row)
-		if len(chunk) > 0 && utf16Len(ConvertMarkdown(head+"\n"+strings.Join(candidate, "\n"))) > limit {
+		if len(chunk) > 0 && convertLen(head+"\n"+strings.Join(candidate, "\n")) > limit {
 			out = append(out, head+"\n"+strings.Join(chunk, "\n"))
 			chunk = nil
 		}
@@ -596,9 +646,9 @@ func splitFenceBlock(body []string, marker string, limit int) []string {
 	fence := func(lines []string) string {
 		return marker + "\n" + strings.Join(lines, "\n") + "\n" + marker
 	}
-	for _, line := range fitRows(body, limit) {
+	for _, line := range fitCodeRows(body, limit) {
 		candidate := append(append([]string{}, chunk...), line)
-		if len(chunk) > 0 && utf16Len(ConvertMarkdown(fence(candidate))) > limit {
+		if len(chunk) > 0 && convertLen(fence(candidate)) > limit {
 			out = append(out, fence(chunk))
 			chunk = nil
 		}
@@ -620,7 +670,7 @@ func packLines(lines []string, limit int) []string {
 	for _, line := range lines {
 		for _, piece := range fitPiece(line, limit) {
 			candidate := append(append([]string{}, chunk...), piece)
-			if len(chunk) > 0 && utf16Len(ConvertMarkdown(strings.Join(candidate, "\n"))) > limit {
+			if len(chunk) > 0 && convertLen(strings.Join(candidate, "\n")) > limit {
 				out = append(out, strings.Join(chunk, "\n"))
 				chunk = nil
 			}
@@ -643,14 +693,31 @@ func fitRows(rows []string, limit int) []string {
 	return out
 }
 
-// fitPiece breaks a run of text until every piece converts within limit units.
-// Markup and escaping inflate the conversion (a lone & becomes &amp;), so the
-// budget is halved until measurement passes; at an 8-unit cut it always does.
+// fitCodeRows normalises fenced lines by their literal length. Inside a code
+// block Telegram shows every character as-is, so a fence row must fit on its
+// own before the packer assembles blocks; inline markdown measurement would
+// undercount it (*a pairs render shorter than they occupy in a fence).
+func fitCodeRows(rows []string, limit int) []string {
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if utf16Len(row) <= limit {
+			out = append(out, row)
+			continue
+		}
+		out = append(out, hardSplitUnits(row, limit)...)
+	}
+	return out
+}
+
+// fitPiece breaks a run of text until every piece renders within limit units.
+// The rendered form can still exceed the piece budget (a --- rule widens to a
+// dash run, compact tables add labels), so the budget is halved until
+// measurement passes; at an 8-unit cut it always does.
 func fitPiece(s string, limit int) []string {
 	if limit < 64 {
 		limit = 64
 	}
-	if utf16Len(ConvertMarkdown(s)) <= limit {
+	if convertLen(s) <= limit {
 		return []string{s}
 	}
 	cut := utf16Len(s) / 2
@@ -658,7 +725,7 @@ func fitPiece(s string, limit int) []string {
 		pieces := hardSplitUnits(s, cut)
 		fits := true
 		for _, piece := range pieces {
-			if utf16Len(ConvertMarkdown(piece)) > limit {
+			if convertLen(piece) > limit {
 				fits = false
 				break
 			}
@@ -694,7 +761,7 @@ func hardSplitUnits(s string, limit int) []string {
 	return out
 }
 
-// ClipConvertible trims text so that its HTML conversion stays within limit
+// ClipConvertible trims text so that its rendered form stays within limit
 // UTF-16 units, marking the cut with an ellipsis. Live previews are edited in
 // place and cannot be split across messages, so they clip instead; without
 // this a long preview would fall back to raw markdown.
@@ -702,14 +769,14 @@ func ClipConvertible(s string, limit int) string {
 	if limit <= 0 {
 		limit = MaxMessageUTF16
 	}
-	if utf16Len(ConvertMarkdown(s)) <= limit {
+	if convertLen(s) <= limit {
 		return s
 	}
 	const marker = "\n…"
 	lo, hi := 0, utf16Len(s)
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
-		if utf16Len(ConvertMarkdown(clipUnits(s, mid)+marker)) <= limit {
+		if convertLen(clipUnits(s, mid)+marker) <= limit {
 			lo = mid
 		} else {
 			hi = mid - 1

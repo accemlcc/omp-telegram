@@ -30,6 +30,14 @@ func TestConvertMarkdownTableInlineMarksStripped(t *testing.T) {
 	}
 }
 
+func TestConvertMarkdownTableKeepsEveryLinkLabel(t *testing.T) {
+	in := "| Links | Note |\n|---|---|\n| [A](https://a.example) [B](https://b.example) | ok |"
+	want := "<pre>Links | Note\n----- | ----\nA B   | ok</pre>"
+	if got := ConvertMarkdown(in); got != want {
+		t.Fatalf("got: %s want: %s", got, want)
+	}
+}
+
 func TestConvertMarkdownInlineFormatting(t *testing.T) {
 	in := "A **bold** B *ital* C ~~gone~~ D `code(x)` E [link](https://example.com) done"
 	want := "A <b>bold</b> B <i>ital</i> C <s>gone</s> D <code>code(x)</code> E <a href=\"https://example.com\">link</a> done"

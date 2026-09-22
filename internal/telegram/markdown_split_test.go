@@ -17,6 +17,17 @@ func TestConvertMarkdownWideTableFallsBackToLabelledLines(t *testing.T) {
 	}
 }
 
+func TestConvertMarkdownWideTableEscapesCompactHeaders(t *testing.T) {
+	in := "| <b>x</b> & y | tool with a very long purpose text | second tool purpose text here |\n|---|---|---|\n| q | r | s |"
+	got := ConvertMarkdown(in)
+	if strings.Contains(got, "<b>x</b>") {
+		t.Fatalf("compact fallback injected header markup: %s", got)
+	}
+	if !strings.Contains(got, "&lt;b&gt;x&lt;/b&gt; &amp; y: q") {
+		t.Fatalf("header not escaped into compact text: %s", got)
+	}
+}
+
 func TestSplitForTelegramKeepsEveryPartConvertible(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("Einleitung mit **fett** und `code`.\n\n")
@@ -35,8 +46,8 @@ func TestSplitForTelegramKeepsEveryPartConvertible(t *testing.T) {
 		t.Fatalf("expected the message to split, got %d part(s)", len(parts))
 	}
 	for i, part := range parts {
-		if n := utf16Len(ConvertMarkdown(part)); n > MaxMessageUTF16 {
-			t.Fatalf("part %d converts to %d units, over the %d limit", i, n, MaxMessageUTF16)
+		if n := convertLen(part); n > MaxMessageUTF16 {
+			t.Fatalf("part %d renders to %d units, over the %d limit", i, n, MaxMessageUTF16)
 		}
 		if strings.Count(part, "```")%2 != 0 {
 			t.Fatalf("part %d has an unbalanced code fence", i)
@@ -90,13 +101,38 @@ func TestSplitForTelegramKeepsSmallBlocksTogether(t *testing.T) {
 func TestClipConvertibleFitsAndMarksTheCut(t *testing.T) {
 	long := strings.Repeat("**x** & `y` ", 700) // 700 * 10 = 7000 units
 	got := ClipConvertible(long, 1200)
-	if n := utf16Len(ConvertMarkdown(got)); n > 1200 {
-		t.Fatalf("clipped text converts to %d units, over the 1200 limit", n)
+	if n := convertLen(got); n > 1200 {
+		t.Fatalf("clipped text renders to %d units, over the 1200 limit", n)
 	}
 	if !strings.HasSuffix(got, "\n…") {
 		t.Fatalf("clipped text must mark the cut, got %q", got[len(got)-20:])
 	}
 	if short := "kurz `x`"; ClipConvertible(short, MaxMessageUTF16) != short {
 		t.Fatal("short text must pass through untouched")
+	}
+}
+
+func TestSplitForTelegramSplitsOversizedFenceLines(t *testing.T) {
+	fits := strings.Repeat("x", MaxMessageUTF16-16)
+	oversized := strings.Repeat("*a", MaxMessageUTF16) // 8192 literal code units
+	md := "```\n" + fits + "\n" + oversized + "\n```\n"
+	parts := SplitForTelegram(md, MaxMessageUTF16)
+	if len(parts) < 2 {
+		t.Fatalf("an oversized code line must split, got %d part(s)", len(parts))
+	}
+	joined := strings.Join(parts, "\n")
+	if !strings.Contains(joined, fits) {
+		t.Fatal("a code line within the limit must stay whole")
+	}
+	if got := strings.Count(joined, "*a"); got != MaxMessageUTF16 {
+		t.Fatalf("oversized code line lost: %d of %d pairs survived", got, MaxMessageUTF16)
+	}
+	for i, part := range parts {
+		if n := convertLen(part); n > MaxMessageUTF16 {
+			t.Fatalf("part %d renders to %d units, over the %d limit", i, n, MaxMessageUTF16)
+		}
+		if strings.Count(part, "```")%2 != 0 {
+			t.Fatalf("part %d has an unbalanced code fence", i)
+		}
 	}
 }

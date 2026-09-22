@@ -324,12 +324,12 @@ func (c *Client) Send(ctx context.Context, chatID, threadID int64, text string, 
 	})
 }
 
-// applyHTML renders markdown as Telegram HTML. Conversions that would exceed
-// the message length limit after escaping fall back to plain text instead of
+// applyHTML renders markdown as Telegram HTML. Conversions whose rendered
+// text would exceed the message limit fall back to plain text instead of
 // risking a rejected send.
 func applyHTML(fields map[string]any, text string) {
 	html := ConvertMarkdown(text)
-	if utf16Len(html) > MaxMessageUTF16 {
+	if renderedUTF16Len(html) > MaxMessageUTF16 {
 		applyPlain(fields, text)
 		return
 	}
